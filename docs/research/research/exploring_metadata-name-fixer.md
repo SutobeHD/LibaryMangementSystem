@@ -4,6 +4,7 @@ title: Normalise artist/title metadata (artist-in-title, featuring, parentheses)
 owner: tb
 created: 2026-05-15
 last_updated: 2026-05-17
+ai_tasks: false
 tags: []
 related: []
 ---
@@ -23,6 +24,7 @@ related: []
 - 2026-05-15 — research/idea_ — exploring_-ready rework loop (deep self-review pass)
 - 2026-05-15 — research/exploring_ — promoted; quality bar met (6/10 OQ resolved + 4 PARKED; Option E added; M0/M1/M2 with Deliverables + Gate blocks)
 - 2026-05-17 — research/exploring_ — deeper exploration toward evaluated_-ready: fixed stale `_db_write_lock` ref (now `app/database.py:22`); added auth-hardening Phase-1 Constraint (`Depends(require_session)` on all metadata-fixer mutation routes); added MusicBrainz client-lib Constraint (`httpx` not pinned, `musicbrainzngs==0.7.1` PyPI-available); added ANLZ string-cache Constraint; split revert-equality Goal (DB byte-identical vs tag semantic); added OQ #11 (ANLZ regen-vs-lazy) + OQ #12 (MB client lib choice); M0 Gate now requires Class-{2} empirical sample + OQ #11 decision; M1 deliverables explicitly require `Depends(require_session)`; M2 deliverables defer client-lib pick to draftplan
+- 2026-05-17 — research/exploring_ — higher-quality-bar rework (implementation-ready bar)
 
 ---
 
@@ -38,7 +40,7 @@ Real-world DJ libraries (especially anything sourced from SoundCloud, YouTube, o
 - Detect malformed `artist`/`title` pairs across DB + ID3 tags. **Metric:** detector flags ≥ 90% recall over all 8 documented classes on a synthetic 500-track corpus (Findings 2026-05-15 — class numbering matches the second table); per-class recall reported separately so noisy classes ({2}, {3}) don't mask precision regressions in high-precision classes.
 - Deterministic transforms with low false-positive rate. **Metric:** on the seeded corpus, applied-rule **precision ≥ 98%** (≤ 2% wrong fixes) on the M1 active subset {1, 4, 5, 6, 7, 8}; **recall ≥ 95%** on the same subset. Classes {2}, {3} excluded from precision SLO until M2.
 - Dry-run preview UI: per-track before/after, grouped by rule, batch-confirm with select/unselect. **Metric:** zero mutation paths reachable without an explicit Apply click; one E2E test asserts this.
-- Audit log of applied changes for revert. **Metric:** every applied mutation produces exactly one undo-log row containing `{run_id, track_id, rule_id, field, before, after}`; revert restores **(a)** `DjmdContent` row to byte-identical JSON and **(b)** `read_tags()` to identical dict (semantic equality — ID3 re-write via mutagen does NOT guarantee byte-identical frames, so raw tag bytes are kept in sidecar for forensic restore only, not as the revert-equality assertion).
+- Audit log of applied changes for revert. **Metric:** every applied mutation produces exactly one undo-log row `{run_id, track_id, rule_id, field, before, after, tag_sha1_before, tag_sha1_after, db_row_before}`. Revert restores **(a)** `DjmdContent` row to byte-identical JSON and **(b)** file SHA1 = `tag_sha1_before` for `.mp3` (mutagen 1.47.0 ID3 round-trip empirically byte-stable 2026-05-17, see Findings). Non-ID3 formats (MP4, Vorbis, FLAC): raw-tag-block sidecar as forensic fallback until M0 Gate per-format check.
 - Optional canonical-source enrichment (MusicBrainz; Discogs deferred). **Metric:** ISRC-driven lookups round-trip a known set of 50 hand-curated tracks to the correct MBID with ≥ 95% accuracy.
 
 **Non-goals** (deliberately out of scope)
@@ -52,7 +54,7 @@ Real-world DJ libraries (especially anything sourced from SoundCloud, YouTube, o
 > External facts that bound the solution space — API rate limits, existing data shape, performance budgets, legal/licensing, team capacity. Cite source where possible.
 
 - **Blast radius huge.** Wrong regex on 30k tracks silently corrupts library. Every mutation path gated by user confirm + audit-log + revert.
-- **DB writer serialisation.** Any `master.db` write MUST acquire `app/database.py:_db_write_lock` (line **22**, `threading.RLock`; CLAUDE.md / `coding-rules.md` reference `app/main.py:_db_write_lock` is stale — see auth-hardening draftplan Constraint, same finding). Access via `from app.database import db_lock` context-manager (line 25). Existing `app/database.py:update_tracks_metadata` (line 1007) does NOT acquire internally — lock held by HTTP-route caller in `app/main.py`.
+- **DB writer serialisation — CURRENTLY BROKEN.** `app/database.py:22` defines `_db_write_lock = threading.RLock()`; `app/database.py:25` defines `@contextmanager db_lock()` wrapper. Empirical 2026-05-17: **0 of 85 write routes (`@app.{post,put,patch,delete}`) in `app/main.py` import or hold either symbol** (grep `db_lock|_db_write_lock` in `app/main.py` → no matches). `update_tracks_metadata` (line 1007) does NOT acquire internally either — so today, `POST /api/track/{tid}` (line 892) and `PATCH /api/tracks/batch` (line 926) write `master.db` lock-free under concurrent requests. CLAUDE.md / `route-architect.md` invariant is aspirational, not enforced. Fixer must (1) acquire `db_lock()` at every metadata-fixer write route, and (2) spawn a parked follow-up topic to retrofit existing routes (out of scope here, but document the gap).
 - **rbox quirks.** rbox 0.1.5/0.1.7 has `unwrap()` panics on parse; mutation goes through `pyrekordbox` directly, not via `SafeAnlzParser`. Writer here must not re-enter `OneLibrary.create_content` (broken — `app/usb_one_library.py`).
 - **Three sources of truth.** ID3 tag (file), Rekordbox `DjmdContent` row (DB), filename. Today `app/audio_tags.py:read_tags` (line 355) reads ID3, falls back to filename **only** for missing artist/title (lines 388–394). `app/audio_tags.py:write_tags` (line 254) mirrors updates back to file; `app/database.py:update_tracks_metadata` (line 1007) writes DB. **Precedence policy undefined today** — must be decided per-field before fixer ships. See §Findings matrix.
 - **Backup engine removed** (commit `8fe5036`, 2026-05-12 — "refactor(backend): drop backup engine, routes, scheduler"; deleted `app/backup_engine.py` and `tests/test_backup_engine.py` plus ~239 lines from `app/main.py`, net -1333 lines per `git show --stat`). Rationale: Rekordbox keeps its own DB backups. Routes removed: `POST /api/library/backup`, `GET /api/library/backups`, `POST /api/library/restore`, `GET /api/library/backup/<h>/diff`, `POST /api/system/cleanup`. No automatic snapshot in-app. Fixer must ship its own scoped before-state capture (per-track JSON diff log minimum) or block on a snapshot replacement.
@@ -60,9 +62,9 @@ Real-world DJ libraries (especially anything sourced from SoundCloud, YouTube, o
 - **Discogs** — 60 req/min authenticated, rich electronic-music coverage, requires OAuth token in `.env`. Not wired. Deferred past M2.
 - **Beatport / Spotify** — clean data, commercial APIs, ToS limits redistribution; legally murky for "rewrite my local library from your catalog". Out of scope.
 - **Security sandbox.** `ALLOWED_AUDIO_ROOTS` + `validate_audio_path` (see `docs/SECURITY.md`, `app/main.py`) bound openable files. Fixer must honor — no shortcuts.
-- **Auth hardening lands first.** `draftplan_security-api-auth-hardening.md` (Phase 1) gates **every** `POST`/`PUT`/`PATCH`/`DELETE` route with `Depends(require_session)` (Bearer-only, no `X-Session-Token` backwards-compat). All proposed `POST /api/metadata-fixer/{scan,apply,revert}` routes MUST declare `dependencies=[Depends(require_session)]` from M1. If auth-hardening Phase 1 hasn't shipped yet at M1 start, fixer blocks on it — never ships a naked mutation route.
-- **MusicBrainz client lib not pinned.** `requirements.txt` ships `requests==2.33.1` only; **no `httpx`, no `musicbrainzngs`**. M2 adds one of: (a) `httpx==<latest-CVE-clean>` + hand-rolled token-bucket; (b) `musicbrainzngs==0.7.1` (ships own rate-limiter, requests-based, smaller surface). Dep choice is a draftplan-time security decision — both require explicit user approval per `agentic-mode.md` "Confirm first" list.
-- **ANLZ string caches.** `.DAT`/`.EXT` files cache title/artist in waveform-overlay strings (Pioneer-side label rendering on CDJ). Open question whether Rekordbox lazy-regens ANLZ after `DjmdContent` mutation or whether fixer must trigger regen via `app/anlz_writer.py`. M1 Gate should re-run `pytest tests/test_pdb_structure.py` + spot-check one ANLZ pre/post on a known track.
+- **Auth hardening — PARTIALLY LANDED.** `draftplan_security-api-auth-hardening.md` Phase 1 ships gate on **all** `POST`/`PUT`/`PATCH`/`DELETE` routes via `Depends(require_session)` (Bearer-only). Verified 2026-05-17: `app/main.py:892` (`@app.post("/api/track/{tid}")`) + `:926` (`@app.patch("/api/tracks/batch")`) already carry `dependencies=[Depends(require_session)]`. `app/auth.py:95` `require_session` enforces `Authorization: Bearer <SESSION_TOKEN>` (split on whitespace, scheme lowercase compare, `safe_compare` constant-time match against boot-time token at `app/auth.py:114`). All proposed `POST /api/metadata-fixer/{scan,apply,revert}` routes declare `dependencies=[Depends(require_session)]` from M1 day 1. No blocking — Phase 1 active.
+- **MusicBrainz client lib not pinned.** `requirements.txt:20` ships `requests==2.33.1` only; `mutagen==1.47.0` at line 58; **no `httpx`, no `musicbrainzngs`** (verified 2026-05-17). PyPI: `musicbrainzngs==0.7.1` (last release 2020-01-11, stale but stable + maintained ratelimiter), `httpx==0.28.1` (active). M2 adds one of: (a) `httpx==0.28.1` + hand-rolled token-bucket; (b) `musicbrainzngs==0.7.1` (ships own 1 req/s rate-limiter, requests-based, smaller surface). Dep choice is a draftplan-time security decision — both require explicit user approval per `agentic-mode.md` "Confirm first" list. `musicbrainzngs` 6-year staleness is a soft-no for new deps in this repo (Schicht-A hardening preference for actively-maintained code) — leans (a).
+- **ANLZ string caches.** `.DAT`/`.EXT` files cache title/artist in waveform-overlay strings (Pioneer-side label rendering on CDJ). `app/anlz_writer.py:737 write_anlz_files` is the regen entry point (writes all three: `.DAT`/`.EXT`/`.2EX`; `backup_existing=True` keeps `_DEFAULT_BACKUP_KEEP` rolling copies). Open: whether Rekordbox lazy-regens after `DjmdContent` mutation alone, or whether fixer must call `write_anlz_files` itself. M0 Gate empirical: mutate title on one fixture track, reload Rekordbox, inspect `ANLZ0000.DAT` SHA before/after — same SHA = lazy never triggers, fixer owns regen; different SHA = lazy regen works, fixer no-op. M1 Gate re-runs `pytest tests/test_pdb_structure.py` after a mass-fix touches USB re-export.
 - **`_split_artists` exists already** at `app/database.py:268` (`re.split(r'(?i),|&|/|;|\s+feat\.?\s+|\s+ft\.?\s+|\s+vs\.?\s+|\s+with\s+', artist_str)`). Splitting ≠ normalising — fixer should call this for downstream artist-list parsing but ship its own normaliser for the field-level fixes.
 - **`usb_pdb.py` byte invariants** downstream of metadata. Re-export after string fixes re-runs PDB writer; short-ASCII vs long-UTF-16-LE path handled by string encoder, but length changes shift page packing. Run `pytest tests/test_pdb_structure.py` after a mass fix lands.
 
@@ -82,7 +84,7 @@ Status: **(R) resolved this iteration**, **(P) parked till evaluated_/draftplan_
 8. **(R)** Snapshot requirement given backup-engine removal? → **Yes, narrowly scoped**. Fixer captures (a) original ID3 byte-block as sidecar in app-data dir and (b) original `DjmdContent` row JSON, both into undo log, **per-track-per-run** before any mutation. No project-wide `master.db` copy — too expensive on 30k libraries and Rekordbox holds the lock often.
 9. **(P)** Smart-quotes / unicode normalisation: NFC vs NFKC? → **NFC for storage** (CDJ-3000 historically more tolerant of NFC); NFKC considered too aggressive (collapses ligatures, full-width chars). Verify on hardware before M1 lock-in.
 10. **(P)** Featuring placement: `Artist feat. X` vs `Title (feat. X)`? → Need empirical pass: export 5 known-good Rekordbox tracks with `feat.` artists and inspect what Rekordbox itself writes to the exported ANLZ + PDB. Decision deferred till that empirical sample exists. Default policy in M1: **leave `feat.` in whichever field it was found**, surface as suggestion only. M0 Gate captures the sample → Class {2} policy resolvable at M1 start, not perpetually deferred.
-11. **(P)** ANLZ string-cache regen after metadata mutation? → `.DAT`/`.EXT` files cache title/artist for CDJ overlays. Two possibilities: (a) Rekordbox lazy-regens on next library reload (no fixer action); (b) ANLZ retains stale strings until explicit re-analyse (fixer triggers via `app/anlz_writer.py`). Resolve at M1 by pre/post-mutation diff on one known track. If (b), M1 ships ANLZ regen step in apply path. If (a), M1 ships nothing extra but documents the lazy-refresh assumption.
+11. **(P)** ANLZ string-cache regen after metadata mutation? → `.DAT`/`.EXT` files cache title/artist for CDJ overlays. Two possibilities: (a) Rekordbox lazy-regens on next library reload (no fixer action); (b) ANLZ retains stale strings until explicit re-analyse (fixer triggers via `app/anlz_writer.py:737 write_anlz_files`). Resolve at **M0 Gate** (moved from M1) via pre/post-mutation + Rekordbox-reload `ANLZ0000.DAT` SHA on one fixture track. **Same SHA after reload = stale = fixer owns regen (case b)**; **different SHA after reload = Rekordbox regenerated = fixer no-op (case a)**. M1 ships `write_anlz_files` call in apply path only if (b) confirms.
 12. **(P)** MusicBrainz client lib: `musicbrainzngs==0.7.1` (PyPI, ships own rate-limiter, requests-based, ~500 LOC surface) vs hand-rolled `httpx.AsyncClient` + token-bucket. → Defer to M2 draftplan. `musicbrainzngs` smaller surface + battle-tested rate-limit, but `httpx` async aligns with `coding-rules.md` "no `requests.get()` in `async def`". Pick at draftplan time alongside dep-add user-approval.
 
 ## Findings / Investigation
@@ -185,6 +187,25 @@ Status: **(R) resolved this iteration**, **(P) parked till evaluated_/draftplan_
 
 **Class-confidence ranking (for M1 high-precision subset):** 4, 5, 6, 1 → very high precision (pure pattern, no semantic ambiguity). 7 → high (anchor on artist string). 8 → medium-high (needs collision check). 2 → policy decision, not a precision question. 3 → low precision without MB (defer to M2).
 
+### 2026-05-17 — higher-quality-bar rework
+
+**Verified empirically:**
+- **mutagen 1.47.0 ID3 round-trip byte-stability** (Python repro 2026-05-17): create `ID3()` with `TIT2 encoding=3`, `TPE1`, `TALB`, save → SHA1 `470849c1`. Re-open, set `TIT2 encoding=1 text='Different'`, save. Re-open, set `TIT2 encoding=3 text='Original Title (Mix)'`, save → SHA1 `470849c1` (identical), file size 5206 bytes, delta 0. **Conclusion:** ID3 revert-equality assertion can use raw-bytes SHA1 directly; raw-block sidecar is redundant for `.mp3`. Per-format check still needed for MP4/Vorbis/FLAC (M0 Gate). Goal text updated.
+- **`_db_write_lock` usage in `app/main.py`** (grep 2026-05-17): `grep "db_lock\|_db_write_lock" app/main.py` → **0 matches** out of **85** `@app.{post,put,patch,delete}` route definitions. `app/main.py:897` (`update_track`) and `:927` (`batch_up`) both call `db.update_tracks_metadata` lock-free. CLAUDE.md / `route-architect.md` / `audio-stack-reviewer.md` invariant is aspirational, not enforced. Fixer routes must hold `db_lock()` — but also surfaces a parked retrofit task (out of scope, document gap, see PARKED).
+- **Auth Phase 1 active**: `app/main.py:892` (`POST /api/track/{tid}`) and `:926` (`PATCH /api/tracks/batch`) carry `dependencies=[Depends(require_session)]`. `app/auth.py:95-115` enforces `Authorization: Bearer <token>` via `safe_compare`. No `X-Session-Token` fallback in the path.
+- **PyPI dep verification** (2026-05-17): `musicbrainzngs==0.7.1` (released 2020-01-11 — 6yr stale), `httpx==0.28.1` (active). `requests==2.33.1` already at `requirements.txt:20`; `mutagen==1.47.0` at `:58`. Neither MB client lib currently pinned.
+- **`app/anlz_writer.py:737`** `write_anlz_files(anlz_dir, track_path, analysis_result, filename_base, backup_existing)` — three-file emitter with built-in rolling backup (`_DEFAULT_BACKUP_KEEP`). This is the regen entry point if Open Q11 resolves to "fixer owns regen". No need to introduce new code paths.
+- **Backup-engine removal** (`git show 8fe5036 --stat`): `app/backup_engine.py` (-583 LOC), `tests/test_backup_engine.py` (-519 LOC), `app/main.py` (-231 LOC), total `3 files changed, 8 insertions, 1333 deletions`. Routes confirmed removed: `POST /api/library/backup`, `GET /api/library/backups`, `POST /api/library/restore`, `GET /api/library/backup/<h>/diff`, `POST /api/system/cleanup`. `POST /api/library/sync` kept but live-mode no-op.
+
+**Line numbers re-verified 2026-05-17** (post-Phase-1):
+- `app/audio_tags.py:_DISPATCH` line **245**, `write_tags` line **254**, `_READ_KEYS` line **309**, `_parse_filename` line **342**, `read_tags` line **355**. Unchanged.
+- `app/database.py:_db_write_lock` line **22**, `db_lock` context-manager line **25-26**, `update_tracks_metadata` line **1007**. `_split_artists` and `_normalize_artist_name` defs no longer match `^def` anchor (likely re-indented as methods inside the DB-singleton class — re-grep without anchor needed before M1, parked).
+
+**Decision:**
+- Open Q11 (ANLZ lazy vs fixer-owned regen) gets a sharper resolution rule: same-SHA pre/post mutation = fixer owns regen via `app/anlz_writer.py:737`; differing SHA = lazy works, fixer no-op.
+- M0 Gate adds per-format tag round-trip test (only ID3 verified to date).
+- Goal text on revert-equality corrected: ID3 IS byte-stable; raw-block sidecar is forensic for non-ID3 formats only.
+
 ## Options Considered
 
 > Required by `evaluated_`. For each viable approach: sketch (2-4 lines), pros, cons, effort (S/M/L/XL), risk.
@@ -224,28 +245,99 @@ Status: **(R) resolved this iteration**, **(P) parked till evaluated_/draftplan_
 - Effort: S
 - Risk: low — but solves the wrong problem at library scale.
 
+### Comparison matrix (decision support)
+
+| Option | Coverage % (est.) | Wall-clock 30k tracks | New deps | Net LOC | Audit-log | False-pos risk |
+|--------|-------------------|-----------------------|----------|---------|-----------|----------------|
+| A regex-only | 70–80 | < 60s detector, apply gated by user | 0 | ~600 (3 files) | yes (sidecar SQLite) | 1–2% on subset {1,4,5,6,7,8} |
+| B hybrid+MB | 88–95 | 8h MB sweep / 30k (1 req/s); incremental delta after cache | 1 (`httpx` or `musicbrainzngs`) | ~900 (A + MB client + cache) | yes | < 1% (MB cross-check) |
+| C LLM | 90+ (opaque) | 200–2000ms/track → 1h–16h; non-deterministic | 1+ (Ollama or cloud SDK) | ~400 | yes but un-auditable rules | unknown — opaque |
+| D detect-only | n/a (no mutation) | < 60s scan | 0 | ~300 | n/a | 0 (no writes) |
+| E inline editor | n/a (manual per track) | unbounded human-time | 0 | ~150 | none new | 0 (user-confirmed) |
+
+Coverage estimates: A from 8-class catalogue precision-rank (Findings 2026-05-15 §codebase verification — 4 classes very-high, 2 high, 1 medium, 1 policy = ~75% recall on real lib by class-frequency weight, not corpus weight). B uplift assumes MB ISRC hit-rate ≥ 70% on libraries with ISRC tags (Finding 2026-05-15 cites MB CC0 + 1 req/s; ISRC fast-path O(1) after cache). C is bibliographic — no in-repo measurement.
+
 ## Recommendation
 
 Phased, each milestone shippable independently. Each phase has explicit deliverables + a gate that must be green to start the next.
 
 ### M0 — Detector + report only (Option D)
 **Deliverables**
-- `app/metadata_fixer/detector.py` — class hierarchy for 8 rule classes; each rule has `match(track) → (confidence: float, suggested: dict)`; **no writes**.
-- New route `GET /api/metadata-fixer/scan` returning `{run_id, matches: [{track_id, rule_id, confidence, before, suggested}]}`.
+- `app/metadata_fixer/__init__.py` (empty package marker) + `app/metadata_fixer/detector.py` — class hierarchy for 8 rule classes; each rule has `match(track) → (confidence: float, suggested: dict)`; **no writes**.
+- New route `GET /api/metadata-fixer/scan` returning `{run_id, matches: [{track_id, rule_id, confidence, before, suggested}]}`. Auth note: GET is read-only — `Depends(require_session)` optional per `coding-rules.md` (mutation-only gate), but recommend including it anyway to keep contract uniform across the fixer API.
 - Read-only frontend view `frontend/src/components/MetadataFixerReport.jsx` listing matches grouped by rule with counts; CSV export.
 - Test corpus: synthetic 500-track JSON fixture covering all 8 classes.
-- `pytest tests/test_metadata_fixer_detector.py` — per-rule precision/recall asserted ≥ 95% on the fixture.
+- `pytest tests/test_metadata_fixer_detector.py` — exact test signatures:
+  - `def test_class1_artist_in_parens_precision_recall()` — asserts `>= 0.95` precision + `>= 0.95` recall against 100 seeded class-1 + 100 negative samples.
+  - `def test_class4_track_num_prefix_strips_only_leading()` — confirms `"01 - Intro"` → `"Intro"` and `"Track 01"` (no leading) → unchanged.
+  - `def test_class5_html_entities_unescape_idempotent()` — applies `html.unescape` twice, asserts second pass = first.
+  - `def test_class6_smart_quotes_to_ascii_then_nfc()` — `"Don’t"` → `"Don't"`, NFC-normalised.
+  - `def test_class7_double_encoded_anchor_match_case_insensitive()` — `"Daft Punk - One More Time"` with artist `"daft punk"` → strip.
+  - `def test_class8_catalog_no_bracket_strip_collision_safe()` — `"Title [MAU5001]"` strip; `"Title [Original Mix]"` preserved.
+  - `def test_detector_full_500_corpus_per_rule_precision_recall()` — fixture-driven, per-rule SLO.
+  - `def test_detector_zero_writes_smoke()` — runs detector on 500-track corpus, asserts `master.db` mtime unchanged + no file in `ALLOWED_AUDIO_ROOTS` mtime-changed.
 
-**Gate to M1:** corpus precision ≥ 95% for classes {1, 4, 5, 6, 7, 8}; user acks scan report on real library; Open Q9 (NFC vs NFKC) decided; **Open Q10 empirical sample captured** (5 `feat.` tracks exported, ANLZ+PDB inspected) — unblocks Class {2} policy at M1 start; **Open Q11 ANLZ regen-vs-lazy decided** via pre/post mutation diff on one fixture track — determines whether M1 apply path needs ANLZ regen step.
+**Pseudocode — first ~30 LoC of `app/metadata_fixer/detector.py` (catalogue scaffold):**
+
+```python
+# app/metadata_fixer/detector.py
+"""Read-only detection of malformed artist/title metadata.
+No writes. No filesystem touches outside read_tags().
+"""
+from __future__ import annotations
+import html
+import re
+import unicodedata
+from dataclasses import dataclass
+from typing import Callable
+
+# Smart-quote translation map (Class 6). NFC after.
+_SMART_QUOTES = {0x2019: 0x27, 0x2018: 0x27, 0x201C: 0x22, 0x201D: 0x22, 0x2013: 0x2D, 0x2014: 0x2D}
+
+# Reused from app.database._normalize_artist_name (line 288 leading "NN - " strip).
+_TRACK_NUM_PREFIX_RE = re.compile(r"^\d{1,2}\s*[-.\s]\s*")
+
+# Class-8 catalog bracket; whitelist mix-name brackets to avoid collision.
+_CATALOG_BRACKET_RE = re.compile(r"\s*\[[A-Z]{2,5}\d{2,5}\]\s*$")
+_MIX_NAME_WHITELIST = {"original mix", "extended mix", "radio edit", "club mix", "dub mix"}
+
+@dataclass(frozen=True)
+class Match:
+    rule_id: int           # 1..8 per Findings table
+    confidence: float      # 0.0..1.0
+    before: dict[str, str] # {"title": ..., "artist": ...}
+    suggested: dict[str, str]
+
+@dataclass(frozen=True)
+class Rule:
+    rule_id: int
+    name: str
+    match_fn: Callable[[dict], Match | None]
+```
+
+Followed by 8 `def _rule_{1..8}(track: dict) -> Match | None` functions registered into `_CATALOGUE: list[Rule]`. `scan(tracks)` iterates the catalogue; never mutates `track`.
+
+**Gate to M1:** corpus precision ≥ 95% for classes {1, 4, 5, 6, 7, 8}; user acks scan report on real library; Open Q9 (NFC vs NFKC) decided; **Open Q10 empirical sample captured** (5 `feat.` tracks exported, ANLZ+PDB inspected) — unblocks Class {2} policy at M1 start; **Open Q11 ANLZ regen-vs-lazy decided** via mutate → Rekordbox-reload → `ANLZ0000.DAT` SHA diff on one fixture track (same SHA = stale = fixer owns regen; different SHA = Rekordbox regenerated, fixer no-op); **per-format tag round-trip test** for MP4/Vorbis/FLAC (ID3 already verified byte-stable 2026-05-17) — if any format drifts, raw-block sidecar is mandatory for that format's revert path.
 
 ### M1 — Apply path (Option A)
 **Deliverables**
-- `app/metadata_fixer/applier.py` — atomic per-track mutation: snapshot ID3 byte-block + `DjmdContent` JSON to `metadata_fixer_log.db` (sidecar SQLite at app-data dir, schema: `runs`, `mutations`), then `update_tracks_metadata` (DB-write-lock held at route layer) + `write_tags`.
-- New routes: `POST /api/metadata-fixer/apply` (body: `{run_id, accepted: [track_id, rule_id]...}`), `GET /api/metadata-fixer/runs`, `POST /api/metadata-fixer/revert` (body: `{run_id}` or `{mutation_ids: [...]}`). **All POST routes declare `dependencies=[Depends(require_session)]`** per auth-hardening Phase 1 — blocks M1 ship until Phase 1 lands.
+- `app/metadata_fixer/applier.py` — atomic per-track mutation. Order: (1) compute `before_sha1 = sha1(open(file,'rb').read())` for tag-bytes; (2) snapshot `DjmdContent` row to sidecar; (3) `with db_lock(): db.update_tracks_metadata([tid], updates)`; (4) `audio_tags.write_tags(path, updates)`; (5) compute `after_sha1`; (6) commit row to `metadata_fixer_log.db`.
+- New routes (all in `app/main.py`, holding `db_lock()` on writers): `POST /api/metadata-fixer/apply` (body `{run_id, accepted: [{track_id, rule_id}]...}`), `GET /api/metadata-fixer/runs`, `POST /api/metadata-fixer/revert` (body `{run_id}` or `{mutation_ids: [...]}`). All POSTs declare `dependencies=[Depends(require_session)]` (verified Phase 1 active — pattern same as `app/main.py:892, 926`).
+- Sidecar SQLite schema (in `metadata_fixer_log.db`):
+  - `runs(run_id TEXT PRIMARY KEY, started_ts INTEGER, finished_ts INTEGER, rule_subset TEXT, user_note TEXT)`
+  - `mutations(mutation_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, track_id TEXT, rule_id INTEGER, field TEXT, before TEXT, after TEXT, db_row_before TEXT, tag_sha1_before TEXT, tag_sha1_after TEXT, applied_ts INTEGER, reverted_ts INTEGER NULL, FOREIGN KEY(run_id) REFERENCES runs(run_id))`
 - Frontend: extend M0 view with per-track checkboxes, rule grouping, "Apply selected (N)" with extra "I reviewed N tracks" modal gate for N > 50.
 - Default-active rule subset: high-precision classes {1, 4, 5, 6, 7, 8} only. Class {2} surfaced as suggestion only (policy unresolved). Class {3} disabled (needs M2 MB cross-check).
 - LLM-suggest button (Option C role): per-track only, surfaces proposal into the same accept-flow. No batch.
-- Tests: round-trip apply→revert restores (a) `DjmdContent` row byte-identical JSON + (b) `read_tags()` semantic equality on the 500-track corpus (per revised Goal — mutagen ID3 rewrite drifts frame bytes, so raw-tag-bytes sidecar is forensic, not equality-source); E2E test asserts no mutation path reachable without Apply click.
+- Tests (exact pytest signatures):
+  - `def test_apply_holds_db_write_lock()` — patches `db_lock` to a `MagicMock` ctxmgr, asserts `__enter__` called once per route invocation.
+  - `def test_apply_then_revert_db_row_byte_identical_json()` — assert `json.dumps(row_after_revert, sort_keys=True) == db_row_before` for all 500 corpus tracks.
+  - `def test_apply_then_revert_tag_sha1_equal_id3()` — `tag_sha1_before == sha1(open(path,'rb').read())` after revert; ID3 only (verified byte-stable 2026-05-17).
+  - `def test_apply_then_revert_tag_sha1_equal_per_format(format)` — parametrised on `["mp3", "flac", "m4a", "ogg"]`; xfail format ≠ mp3 unless M0 Gate per-format check passes.
+  - `def test_no_mutation_without_explicit_apply_click()` — E2E via `e2e-tester` subagent: open MetadataFixerReport with detected matches, navigate away, assert `master.db` mtime + `metadata_fixer_log.db` row-count unchanged.
+  - `def test_pdb_structure_green_after_mass_fix()` — runs M1 apply over 100-track corpus + invokes USB exporter on a tmp drive image, calls existing `tests/test_pdb_structure.py::test_*` against the result.
+
+**Expected git diff scope:** new files `app/metadata_fixer/__init__.py`, `app/metadata_fixer/detector.py` (~250 LOC), `app/metadata_fixer/applier.py` (~200 LOC), `app/metadata_fixer/schema.py` (~50 LOC for sidecar DDL), `tests/test_metadata_fixer_detector.py` (~300 LOC fixtures + assertions), `tests/test_metadata_fixer_applier.py` (~150 LOC), `frontend/src/components/MetadataFixerReport.jsx` (~300 LOC), `frontend/src/api/metadataFixer.js` (~60 LOC axios wrappers). Modified: `app/main.py` (+~80 LOC for 3 routes + lock acquisition), `requirements.txt` (no change for M0/M1; +1 line at M2 for `httpx==0.28.1`), `docs/backend-index.md` (+3 route entries), `docs/frontend-index.md` (+1 component entry).
 
 **Gate to M2:** on real-library dry-run, applied-rule false-positive rate ≤ 2% (user-reported); revert verified once on a real run; `pytest tests/test_pdb_structure.py` green after a mass-fix touches USB re-export.
 

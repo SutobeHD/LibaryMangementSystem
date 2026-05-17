@@ -3,7 +3,7 @@ slug: analysis-underground-mainstream-classifier
 title: Underground vs Mainstream classifier / certifier for tracks
 owner: tb
 created: 2026-05-15
-last_updated: 2026-05-15
+last_updated: 2026-05-17
 tags: [analysis, popularity, sidecar-db, multi-source, fuzzy-match]
 related: [external-track-match-unified-module]
 ai_tasks: false  # set true to opt-in AI routines — see ## AI Tasks below
@@ -24,6 +24,7 @@ ai_tasks: false  # set true to opt-in AI routines — see ## AI Tasks below
 - 2026-05-15 — research/idea_ — exploring_-ready rework loop (deep self-review pass)
 - 2026-05-15 — research/exploring_ — promoted; quality bar met (Spotify cold-scan 3h→3.3min via batch endpoint; 8/12 OQ resolved; Findings #2 supersede; M1-M4 phased rollout)
 - 2026-05-15 — research/exploring_ — deeper exploration pass (toward evaluated_ readiness)
+- 2026-05-17 — research/exploring_ — higher-quality-bar rework (implementation-ready bar)
 
 ## AI Tasks
 
@@ -43,8 +44,8 @@ Routine MUST tick items it processed: `- [x] <original text> — done YYYY-MM-DD
 When archived: keep section as audit trail.
 -->
 
-- [ ] grep `SELECT.*Genre` in app/database.py to confirm Genre-coverage measurement path for Q2/Q12 audit
-- [ ] web: Spotify Web API Client Credentials commercial-use ToS clause (Q11 PARKED → legal-track answer)
+- [x] grep `SELECT.*Genre` in app/database.py to confirm Genre-coverage measurement path for Q2/Q12 audit — done 2026-05-17 (0 SQL hits; Genre lives in XML at L114/L229/L628; audit reads in-memory `db.tracks.values()` per Findings #6)
+- [ ] web: Spotify Web API Client Credentials commercial-use ToS clause (Q11 PARKED → legal-track answer; Q11 already resolved via user-supplied-keys fallback, but ToS clarity still valuable for documentation)
 - [ ] investigate: ListenBrainz API rate limits + scrobble-data shape for M3 4th-source candidate
 
 ---
@@ -252,37 +253,74 @@ Output captured: `(total, coverage_ratio, num_genres, distinct_clusters_ge_100, 
 
 **Open Questions touched (this entry):** Q2 (genre-relative vs global) — UNBLOCKED with concrete coverage-based decision rules; PARKED-with-plan. Q12 (cluster-size threshold) — `≥ 100` defended + `≥ 50` soft fallback + user-tunable; PARKED-with-plan.
 
+### 2026-05-17 — implementation-readiness re-verification (higher-bar pass)
+
+**Re-Grep empirical (2026-05-17):**
+- `Grep "playback_count" app/` → 0 hits. Confirms no SC popularity code path today; M1 = pure additive change to `_normalize_track` at `soundcloud_api.py:297-330`.
+- `Grep "_normalize_track" app/soundcloud_api.py` → defined L297, called from L366, L419, L479, L538 (4 call-sites all flow through same normalizer — single-point edit propagates everywhere).
+- `Grep "_db_write_lock" app/database.py` → defined L22, `db_lock()` ctx-mgr L26-40, `_serialised` decorator L43-53. Popularity sidecar is its own SQLite file → **does NOT** share `_db_write_lock`; new per-popularity-file lock (`threading.Lock`) sufficient. Avoids contention with Rekordbox writes (key design property).
+- `Grep "Genre" app/database.py` → L114 parse (`node.get("Genre")`), L229 count (`genre_counts[t["Genre"]] += 1`), L628 XML setter. `SELECT.*Genre` grep returns 0 — Genre lives only in XML, not SQLite query layer. Q2 audit script reads `db.tracks.values()` in-memory dict, not SQL.
+- `Grep "require_session" app/main.py` → import L33, applied to every POST/PUT/PATCH/DELETE route. Confirms popularity routes follow same pattern: GET reads unauthed (cache lookup); POST refresh authed.
+
+**PyPI verification (2026-05-17):**
+- `spotipy` latest = **2.26.0** (PyPI verified). MIT, ~5 deps (requests, urllib3, redis-optional). Decision: **hand-roll** — Findings #2 already chose Client Credentials only; spotipy's value-add (PKCE, scopes, refresh) is OAuth flows we don't use. Saves transitive deps (esp. blocking `requests` — Schicht-A prefers httpx async per coding-rules.md).
+- `pylast` latest = **7.0.2** (PyPI verified). Apache-2.0, ~3 deps (httpx, certifi). Closer fit (httpx-native). **Trade-off**: pylast handles XML→Python type marshalling for `track.getInfo`. Hand-roll = 1 httpx call + 1 `xml.etree.ElementTree.fromstring`. Verdict: **hand-roll** (consistent with spotipy decision; consistent with `app/soundcloud_api.py` hand-roll pattern); 0 new pinned deps in `requirements.txt`. Re-evaluate if Last.fm adds OAuth-only endpoints we need later (unlikely for popularity-read).
+- **Net new pins at M2:** zero. Continues `app/soundcloud_api.py` hand-roll posture.
+
+**Sidecar precedent re-verified at byte level:**
+- `app/analysis_cache.py:42-44`: cache dir defaults to `Path.home() / ".cache" / "rb_editor_pro" / "analysis_cache"` — XDG-cache convention. **Popularity mirrors**: `Path.home() / ".cache" / "rb_editor_pro" / "popularity" / "popularity.sqlite"`.
+- `app/analysis_cache.py:124-126`: `self._lock = threading.Lock()` + atomic temp+rename for index writes. **Popularity adopts**: per-instance `threading.Lock` for write-path, sqlite WAL mode for concurrent reads.
+- `app/anlz_sidecar.py:24-27`: `sha1(abs_path)[:16]` deterministic per-track key. **Not adopted**: popularity keys on `track_id` (Rekordbox int ID, stable across rescans) — not file path (renames break it). track_id source = `RekordboxXMLDB.tracks` dict key (string of int).
+
+**Genre coverage sample audit (2026-05-17 — local M1-blocker resolution path):**
+The Q2 audit is **already runnable today** without new code — the dict is in-memory:
+```python
+# Run-once at sidecar boot; output to popularity_audit.json
+from app.database import db
+from collections import Counter
+genres = Counter()
+null_count = 0
+for t in db.tracks.values():
+    g = (t.get("Genre") or "").strip().lower()
+    g = re.sub(r"\([^)]*\)\s*$", "", g).strip()  # strip "Techno (Peak Time)" tail
+    g = re.sub(r"\s+", " ", g)                    # collapse whitespace
+    if g:
+        genres[g] += 1
+    else:
+        null_count += 1
+total = len(db.tracks)
+coverage = (total - null_count) / total if total else 0.0
+clusters_ge_100 = {g: c for g, c in genres.items() if c >= 100}
+audit = {
+    "total": total,
+    "coverage": round(coverage, 3),
+    "null_count": null_count,
+    "distinct_genres": len(genres),
+    "clusters_ge_100": len(clusters_ge_100),
+    "clusters_ge_50": sum(1 for c in genres.values() if c >= 50),
+    "top_20": dict(genres.most_common(20)),
+}
+```
+M1 ships this in `app/popularity_audit.py` as standalone module — single dependency on `app.database.db` singleton (already imported across `app/main.py`). Cost: ~30k dict iterations; sub-second on real libraries.
+
+**Tooling discipline re-verification:**
+- `httpx.AsyncClient` retry envelope: `app/soundcloud_api.py:167-232` is canonical pattern (max_retries loop, exponential backoff, 429 `Retry-After` parsing, classified 401/403/404 outcomes). Popularity adapters copy verbatim with platform-specific exception types.
+- `require_session` gate on writes: `app/main.py:33` (import), applied on lines L557, L582, L630, L733, L773, L845, L859, L875, L886 (sampled). Popularity refresh endpoint (POST) gated; popularity read (GET) ungated.
+
+**Open Questions touched (this entry):** none directly resolved — entire entry is implementation-readiness verification. All prior PARKED/RESOLVED states preserved.
+
 ## Options Considered
 
-> Required by `evaluated_`. For each viable approach: sketch (2-4 lines), pros, cons, effort (S/M/L/XL), risk.
+> Quantified table. Effort = engineer-hours including tests. LoC = net new across `app/` (excludes deletions). Risk score 1–5 (5 = high).
 
-### Option A — Single-source MVP (SoundCloud only)
-- Sketch: Read `playback_count` from the SoundCloud V2 response already fetched by `soundcloud_api.py`, log-scale, percentile-rank within library, store in sidecar DB. No new providers.
-- Pros: Zero new auth or env vars; reuses existing client + fuzzy matcher; ships fastest; validates UX and storage shape before scaling.
-- Cons: Heavily biased toward SoundCloud demographics (electronic-leaning); silent on tracks not on SC; one platform = one outage = no score.
-- Effort: S
-- Risk: Low. Worst case = poor signal quality; easy to layer more providers later.
+| Opt | Sketch | Pros | Cons | Effort (h) | LoC (≈) | Risk | New deps |
+|-----|--------|------|------|------------|---------|------|----------|
+| **A** | SC-only. Read `playback_count` from existing SC payload at `_normalize_track` (`soundcloud_api.py:297-330`) + log10 + library-ECDF + sidecar SQLite. | Zero new auth; 4 SC call-sites already routed through `_normalize_track`; ships fastest; validates UX + storage. | Bias: SC demographics (electronic). Silent on non-SC tracks. 1-of-1 = `confidence=low` mandatory. | 20-30 | ~350 | 2 | 0 |
+| **B** | A + Spotify (`q=isrc:` batch 50) + Last.fm (`track.getInfo` MBID/fuzzy@0.80). Per-genre ECDF normalisation. Equal-mean aggregate. Banding heuristic from D layered. | 3-platform cross-validation; covers bedroom/indie/commercial; per-platform raw counts surfaced (Q9). | 2 new env-var pairs (Spotify + Last.fm). Match-quality dominates signal; bad fuzzy = bad score. Spotify recency-bias misrepresents vintage hits. | 80-120 | ~1100 | 3 | 0 (hand-roll) |
+| **C** | MB-MBID anchoring first; popularity keyed by MBID (Spotify, Last.fm, ListenBrainz). Fuzzy fallback per-source. | Highest match precision. ListenBrainz = 0 quota. MBID stable across title edits. | MB coverage on underground electronic ≈ 30-50% (vs ≥ 95% on commercial). Inverts signal: most-underground = unscored. +1 resolution hop per track. | 100-160 | ~1500 | 4 | 0 (MB hand-roll) |
+| **D** | Banding-only. Fixed per-platform log-thresholds → vote across available. No continuous score. | Simplest UX. No normalisation maths. Resilient to null Genre. | Magic thresholds; loses within-band ordering; recombining platforms = re-tune. | 40-60 | ~600 | 3 | 0 |
 
-### Option B — Multi-source aggregate (Spotify + SoundCloud + Last.fm; YouTube deferred to M4)
-- Sketch: Match each track against 3 platforms at M2 (ISRC → MBID → fuzzy@0.80). Normalise via log + per-genre percentile (per Findings #3 formula). Aggregate by mean. Emit continuous score + derived band.
-- Pros: Robust to single-platform gaps; cross-validates; bedroom/indie/commercial axes covered.
-- Cons: Three new API integrations + secrets; matching quality dominates the signal — bad matches = bad scores; recency-biased Spotify `popularity` may misrepresent vintage hits.
-- Effort: L
-- Risk: Medium. Match false-positives + Spotify recency-bias are main failure modes; mitigable with caching + tightened thresholds + per-platform raw-count UI for user verification.
-
-### Option C — MusicBrainz-anchored canonical aggregate
-- Sketch: Resolve every track to a MusicBrainz Recording MBID first (via ISRC or fuzzy), then look up popularity from platforms keyed by MBID (Spotify, Last.fm, ListenBrainz). Anything unresolvable falls back to fuzzy-per-platform.
-- Pros: Highest match quality; ListenBrainz gives open scrobble data with no quota; durable canonical IDs survive title edits.
-- Cons: MusicBrainz coverage of underground electronic releases is patchy — the very tracks we want to classify as "underground" are the ones with no MBID; adds an extra resolution hop per track.
-- Effort: L
-- Risk: Medium-high. Coverage gap may invert the signal (most-underground = unscored).
-
-### Option D — Banding-only heuristic (no continuous score)
-- Sketch: Look up per platform; bucket directly into `underground` (<1k plays), `niche` (1k–50k), `rising` (50k–500k), `mainstream` (>500k) using fixed log thresholds per platform; take majority vote across available platforms.
-- Pros: Simplest UX; no normalisation maths; resilient to missing genre tags.
-- Cons: Thresholds are arbitrary and platform-specific; loses ordering within a band; harder to recombine when adding/removing platforms later.
-- Effort: M
-- Risk: Medium. Likely needs re-tuning per platform over time; banding feels "magic" to users.
+**Risk legend:** 1 trivial · 2 reversible feature-flag · 3 ToS/match-quality concern · 4 data-shape inversion possible · 5 architecture-blocking.
 
 ## Recommendation
 
@@ -317,11 +355,125 @@ Output captured: `(total, coverage_ratio, num_genres, distinct_clusters_ge_100, 
 - **Exit**: YouTube/Beatport adapters in production, quota dashboard / log line shows < 50% daily budget consumed.
 - **Effort**: M.
 
+### M1 skeleton — first ~30 LoC + route sigs (implementation-ready)
+
+`app/popularity_engine.py` (NEW, ~350 LoC total at M1 exit; head ~30 LoC pseudocode):
+```python
+"""
+Popularity sidecar engine — SoundCloud-only at M1.
+Sidecar lives at ~/.cache/rb_editor_pro/popularity/popularity.sqlite.
+Mirrors layout precedent of app/analysis_cache.py (XDG-cache convention).
+"""
+from __future__ import annotations
+import logging, sqlite3, threading, time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+SCHEMA_VERSION = 1
+DEFAULT_TTL_SECONDS = 86_400  # 24h for SC; per-platform override at M2
+Platform = Literal["soundcloud", "spotify", "lastfm"]
+
+def _default_db_path() -> Path:
+    p = Path.home() / ".cache" / "rb_editor_pro" / "popularity" / "popularity.sqlite"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+class PopularityStore:
+    """Per-track per-platform popularity sidecar. SQLite WAL, threadsafe writes."""
+    def __init__(self, db_path: Path | None = None):
+        self._db_path = db_path or _default_db_path()
+        self._lock = threading.Lock()
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        with self._connect() as c:
+            c.executescript("""
+                PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS popularity (
+                  track_id TEXT NOT NULL, platform TEXT NOT NULL,
+                  raw_count INTEGER, log_count REAL, percentile REAL,
+                  fetched_at INTEGER NOT NULL,
+                  match_method TEXT, match_confidence REAL,
+                  PRIMARY KEY (track_id, platform)
+                );
+                CREATE INDEX IF NOT EXISTS ix_pop_fetched ON popularity(fetched_at);
+            """)
+```
+
+`app/main.py` route additions (~25 LoC net):
+```python
+# READ — unauthed (cache lookup only, no mutation)
+@app.get("/api/popularity/{tid}")
+async def get_popularity(tid: str) -> dict: ...
+# Returns {"track_id", "mainstream_score", "mainstream_band", "confidence",
+#          "platforms": [{"platform","raw_count","percentile","fetched_at"}]}
+
+# REFRESH — authed (mutates sidecar)
+@app.post("/api/popularity/{tid}/refresh", dependencies=[Depends(require_session)])
+async def refresh_popularity(tid: str, force: bool = False) -> dict: ...
+# force=True bypasses TTL. Returns same shape as GET after refresh.
+
+# BULK BACKGROUND — authed
+@app.post("/api/popularity/scan", dependencies=[Depends(require_session)])
+async def scan_popularity(platforms: list[Platform] | None = None) -> dict: ...
+# Returns {"job_id","queued","ttl_skipped"} — actual work runs background task.
+```
+
+### M1 pytest signatures (exact — drop into `tests/test_popularity_engine.py`)
+
+```python
+# Unit — sidecar storage
+def test_popularity_store_init_creates_schema(tmp_path): ...
+def test_popularity_store_upsert_then_get_roundtrip(tmp_path): ...
+def test_popularity_store_ttl_expiry_returns_none(tmp_path, monkeypatch): ...
+def test_popularity_store_concurrent_writes_no_corruption(tmp_path): ...  # 4 threads × 100 writes
+
+# Unit — normalisation math
+def test_log_count_zero_returns_zero(): ...               # log10(1+0) == 0
+def test_ecdf_within_genre_basic_distribution(): ...      # 100-track synthetic
+def test_ecdf_library_wide_fallback_when_genre_null(): ...
+def test_band_thresholds_underground_niche_rising_mainstream(): ...
+def test_aggregate_score_mean_two_platforms(): ...
+def test_aggregate_score_single_platform_low_confidence(): ...
+def test_aggregate_score_zero_platforms_unknown_band(): ...
+
+# Integration — SC payload reads playback_count after _normalize_track edit
+def test_normalize_track_now_carries_playback_count(): ... # asserts SC payload key propagates
+
+# Audit (Q2/Q12 measurement side-deliverable)
+def test_genre_audit_coverage_ratio_basic(): ...
+def test_genre_audit_parenthetical_normalisation(): ...   # "Techno (Peak Time)" → "techno"
+def test_genre_audit_emits_audit_json(tmp_path): ...
+
+# Route — FastAPI TestClient
+def test_get_popularity_returns_404_for_unknown_track(client): ...
+def test_get_popularity_returns_score_for_seeded_track(client, seed_pop): ...
+def test_post_refresh_requires_session_token(client): ...  # 401 without Bearer
+def test_post_refresh_force_bypasses_ttl(client, seed_pop, monkeypatch): ...
+```
+
+**Run target at M1 exit:** `pytest tests/test_popularity_engine.py -v` green; ≥ 18 tests.
+
+### M1 git diff lines (prose preview — no `git mv`, no commit yet)
+
+- NEW `app/popularity_engine.py` ~350 LoC (sidecar store + SC reader + normaliser + aggregator).
+- NEW `app/popularity_audit.py` ~80 LoC (genre histogram + audit JSON emitter, runs on first scan).
+- NEW `tests/test_popularity_engine.py` ~300 LoC (~18 tests per sigs above).
+- EDIT `app/soundcloud_api.py:329` — add `"playback_count": raw.get("playback_count", 0),` to `_normalize_track` dict. 1-line addition; non-breaking.
+- EDIT `app/main.py` — register 3 routes (GET/POST refresh/POST scan). ~25 LoC + import.
+- EDIT `requirements.txt` — **no changes** (hand-roll httpx posture; httpx already pinned).
+- EDIT `docs/backend-index.md` — append 3 routes under new "popularity" group.
+- EDIT `docs/MAP.md` / `MAP_L2.md` — regenerated via `python scripts/regen_maps.py` (deterministic).
+
 **Gates before promotion `exploring_` → `evaluated_`:**
 - M1 entry conditions met (Q1/Q3/Q6 RESOLVED; Q11 ToS-path chosen: user-supplied-keys fallback ships from day one to sidestep distribution-credential question).
-- Library audit logic specified (Q2 + Q12 PARKED-with-plan per Findings #5 — concrete query + coverage-threshold decision rules + cluster-size soft/hard thresholds).
+- Library audit logic specified (Q2 + Q12 PARKED-with-plan per Findings #5 — concrete query + coverage-threshold decision rules + cluster-size soft/hard thresholds; runnable audit code in Findings #6).
 - Cross-doc coordination point with `external_track_match_unified_module` locked (Findings #4: M1 surface is exact match for popularity's needs; pre-sibling-M1 fallback = thin wrapper around `SoundCloudSyncEngine._fuzzy_match_with_score`, swap at sibling-M1 ship — mechanical, not architectural).
-- Concrete sidecar SQLite location: under `Path.home() / ".cache" / "rb_editor_pro" / "popularity"` (mirrors `app/analysis_cache.py:44` precedent — XDG-cache convention; survives reinstall; user can wipe without losing settings), named `popularity.sqlite` + sibling `popularity_audit.json` for genre-coverage measurement output.
+- Concrete sidecar SQLite location: `Path.home() / ".cache" / "rb_editor_pro" / "popularity" / "popularity.sqlite"` (mirrors `app/analysis_cache.py:44`); audit output sibling `popularity_audit.json`.
+- Zero new pinned deps at M1 + M2 (Findings #6: spotipy + pylast hand-rolled; httpx already in tree).
+- pytest signatures + M1 LoC skeleton + git-diff preview specified above — no design discovery left at implementation time.
 - Owner confirms Q8 (UI surface) belongs in separate frontend exploration — backend ships score + band + per-platform raw, frontend chooses surface independently. PARKED status preserved.
 
 ---
