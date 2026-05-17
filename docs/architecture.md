@@ -203,13 +203,63 @@ needs to revert in-app edits, they restore from Rekordbox.
 
 | Layer | Mechanism |
 |-------|-----------|
-| API auth | Session token (`X-Session-Token` header) on system endpoints |
-| CORS | Locked to `localhost` origins only |
-| File access | `ALLOWED_AUDIO_ROOTS` sandbox — all paths validated before I/O |
-| Secrets | SoundCloud tokens stored in OS keyring (never in .env or code) |
+| API auth | `Authorization: Bearer <token>` on all 84 mutation routes (`require_session` dep in `app/auth.py`). Heartbeat ungated. Phase-1 details below. |
+| CORS | Locked to `localhost` + `tauri://localhost` origins only |
+| File access | `ALLOWED_AUDIO_ROOTS` sandbox — all paths validated via `Path.is_relative_to(resolved_root)` before I/O |
+| Secrets | SoundCloud tokens stored in OS keyring; sidecar session token in `%APPDATA%/MusicLibraryManager/.session-token` (user-data dir, never in repo) |
 | Client ID | SC client ID scraped dynamically or from `.env` |
-| Tauri | `capabilities/main.json` — minimal permission grants |
+| Tauri | `capabilities/main.json` — minimal permission grants; sidecar stdout reader captures + scrubs `LMS_TOKEN=` banner before log-forwarding |
 | SQL | SQLAlchemy ORM or parameterized queries — no string interpolation |
+
+### 8. Bearer Auth Bootstrap (Phase 1 — landed 2026-05-17)
+
+Source of truth: `app/auth.py`. Draftplan: `docs/research/implement/draftplan_security-api-auth-hardening.md`.
+
+```
+[Python sidecar boot]
+  app/auth.py at import time:
+    SESSION_TOKEN = secrets.token_urlsafe(32)
+    sys.stdout.write("LMS_TOKEN=<value>\n")           ← first stdout line
+    %APPDATA%/MusicLibraryManager/.session-token      ← persisted (user-data dir)
+        │
+        ├── Tauri prod (shell.sidecar("rb-backend"))
+        │     src-tauri/src/main.rs:472 CommandEvent::Stdout
+        │     → capture_token_line() strips "LMS_TOKEN=" prefix
+        │     → stores in tauri::State<SessionToken> (Arc<Mutex<String>>)
+        │     → DROPS the line (never forwarded to log::info!)
+        │
+        ├── Tauri dev (spawn_dev_backend → spawn_child)
+        │     src-tauri/src/main.rs:138 same logic on BufReader::lines()
+        │
+        └── Browser dev (`npm run dev:full`)
+              frontend/vite.config.js dev-middleware
+              → on vite startup: reads %APPDATA%/.../.session-token
+              → re-exposes content at GET /dev-token
+
+[React frontend bootstrap]
+  frontend/src/api/api.js (top-level bootstrap promise):
+    if (window.__TAURI_INTERNALS__) {
+        token = await invoke('get_session_token')  ← retry loop on "token-not-ready"
+    } else {
+        token = await fetch('/dev-token').text()
+    }
+    setSessionToken(token)
+    [if both fail → toast + authStore._authBootstrapFailed = true]
+
+[Every HTTP request thereafter]
+  axios interceptor:
+    config.headers['Authorization'] = `Bearer ${getSessionToken()}`
+        │
+        ▼
+  FastAPI route with dependencies=[Depends(require_session)]:
+    app/auth.py require_session():
+        split scheme on whitespace, lowercase compare to "bearer"
+        strip + reject empty / control-char / wrong-length
+        secrets.compare_digest(candidate, SESSION_TOKEN)
+        on mismatch: HTTPException(401, "Unauthorized")
+```
+
+**Token rotation:** only on sidecar process restart. Tauri spawns one sidecar per app lifetime; force-rotate = `POST /api/system/restart`. Phase 2 paired-device tokens have separate per-device lifecycle.
 
 ---
 
