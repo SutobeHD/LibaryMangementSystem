@@ -31,6 +31,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.auth import require_session
+from app.rate_limit import rate_limit
 
 # EC9: Load .env file so SOUNDCLOUD_CLIENT_ID etc. are available as env-vars.
 # python-dotenv is a soft dependency; if missing we fall back to os.environ silently.
@@ -2058,13 +2059,15 @@ async def shutdown_watcher_event():
         logger.warning("FolderWatcher shutdown error: %s", exc)
 
 @app.post("/api/system/shutdown", dependencies=[Depends(require_session)])
-async def shutdown():
+@rate_limit(steady=5.0, burst=10, key_mode="both")
+async def shutdown(request: Request):
     """Trigger sidecar shutdown. Gated by ``require_session`` Bearer."""
     threading.Thread(target=_graceful_shutdown, daemon=True).start()
     return {"message": "Shutting down..."}
 
 @app.post("/api/system/restart", dependencies=[Depends(require_session)])
-async def restart():
+@rate_limit(steady=5.0, burst=10, key_mode="both")
+async def restart(request: Request):
     """Trigger sidecar restart. Gated by ``require_session`` Bearer."""
     def restart_proc():
         logger.info("Restarting backend...")
@@ -3030,7 +3033,10 @@ class ScAuthTokenReq(BaseModel):
 
 
 @app.post("/api/soundcloud/auth-token", dependencies=[Depends(require_session)])
-async def set_soundcloud_auth_token(r: ScAuthTokenReq, response: Response):
+@rate_limit(steady=5.0, burst=10, key_mode="both")
+async def set_soundcloud_auth_token(
+    request: Request, r: ScAuthTokenReq, response: Response
+):
     """
     EC7/EC13: Persist the SC OAuth token in the OS keyring (not in cookies or JSON).
     Sets a lightweight HttpOnly sentinel cookie so frontend can detect auth state
