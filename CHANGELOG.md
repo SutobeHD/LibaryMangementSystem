@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+- Added: Phase-1 Bearer-token authentication on 84 mutation endpoints.
+  New `app/auth.py` self-generates session token at sidecar boot, captured
+  by Tauri stdout reader + dev-middleware fallback. Frontend attaches
+  `Authorization: Bearer` via bootstrap promise. New `safe_compare` helper.
+  `SHUTDOWN_TOKEN` query-string scheme deleted (redundant under `require_session`).
+
 ## v1.0.0-beta — 2026-05-07
 
 First public **beta**. Standalone DJ-library manager that competes with

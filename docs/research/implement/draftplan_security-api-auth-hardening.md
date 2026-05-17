@@ -24,6 +24,7 @@ priority: 1
 - 2026-05-15 — research/exploring_ — Phase-1 draftplan written by route-architect
 - 2026-05-15 — implement/draftplan_ — promoted; 6 open questions resolved by user sign-off; plan revised (stdout+file token handoff, no env-var; no slowapi P1; Bearer-only, no X-Session-Token compat; init-token deleted)
 - 2026-05-15 — implement/draftplan_ — review feedback applied (10 must-fix + ~12 should-fix items)
+- 2026-05-17 — implement/draftplan_ — Phase-1 implementation complete (commits 6021acf..f90f5f8 + 8498937 safe_compare) + doc-sync (62eb9c0 + this)
 
 ---
 
@@ -499,8 +500,19 @@ The following 5 hot-fixes landed in commit `e3a5ae8` and are assumed in-place. P
 
 > Filled during `inprogress_`. What got built, what surprised us, what changed from the plan. Dated entries.
 
-### YYYY-MM-DD
-- …
+### 2026-05-17 — Phase-1 shipped
+
+- **84/85 mutation routes gated.** Every POST/PUT/PATCH/DELETE in `app/main.py` declares `dependencies=[Depends(require_session)]`. Only `POST /api/system/heartbeat` is intentionally open — body-less loopback healthcheck with no token leak. Verified by `grep -c "Depends(require_session)" app/main.py` = 84 vs `grep -cE "@app\.(post|put|patch|delete)\(" app/main.py` = 85.
+- **`SHUTDOWN_TOKEN` query-string scheme deleted** in commit `7dfdef5`. Single auth axis now: every mutation goes through `require_session`. `POST /api/system/init-token` removed (now returns 404 — asserted in `tests/test_auth.py`). Heartbeat response no longer carries any token field.
+- **Token handoff:** `app/auth.py` generates `secrets.token_urlsafe(32)` on sidecar boot in the main process only (worker subprocesses get empty string), emits `LMS_TOKEN=<value>\n` once on stdout, persists to `<user_data_dir>/MusicLibraryManager/.session-token`. Tauri Rust supervisor's stdout reader (`src-tauri/src/main.rs`) matches the prefix, stashes value in `SessionToken(Arc<Mutex<String>>)`, **drops the banner line before forwarding to `log::info!`** so the token never reaches `log/app.log`. Browser-dev path reads the file via new `devTokenPlugin` in `frontend/vite.config.js` (`GET /dev-token`).
+- **Frontend bootstrap:** axios interceptor in `frontend/src/api/api.js` blocks on a bootstrap promise that races Tauri IPC (`get_session_token`) against the dev-middleware. Token landed in `frontend/src/store/authStore.js`. On hard failure flips `_authBootstrapFailed=true` + persistent toast (`id: 'auth-bootstrap-failed'`) so mutation UI can disable itself.
+- **`safe_compare` extracted** (commit `8498937`) as `app/security_compare.py`. Wraps `secrets.compare_digest` with the 5-case fragility matrix from the codebase audit (`docs/research/research/evaluated_security-secrets-compare-digest-codebase-audit.md`). `require_session` rewritten to use it.
+- **Rate limiter shipped + wired on 3 HIGH-tier routes.** Module `app/rate_limit.py` landed in `830c056` per the evaluated rate-limit design doc. Decorator applied to `POST /api/system/shutdown`, `POST /api/system/restart`, `POST /api/soundcloud/auth-token` in commit `e78fb24` (`@rate_limit(steady=5.0, burst=10, key_mode="both")`). Decorator order is `@app.post(...)` outermost → `@rate_limit(...)` inner → `Depends(require_session)` via `dependencies=` kwarg, so `require_session` raises 401 BEFORE the bucket is decremented (verified by `tests/test_rate_limit.py::test_auth_before_ratelimit` and `tests/test_auth.py` TestCaseF/G). Remaining MEDIUM/LOW-tier wiring deferred to Phase-2.
+- **Test suite green: 219+ tests pass.** New: `tests/conftest.py` (autouse `auth_token` fixture + `no_auth` marker), `tests/test_auth.py` (20 cases — Bearer parsing matrix), `tests/test_security_compare.py` (17 cases — fragility matrix), `tests/test_rate_limit.py` (7 cases — token-bucket refill/burst/whitelist/auth-ordering). Existing tests continued to work without modification — the autouse fixture monkeypatches `SESSION_TOKEN` per-test so they speak Bearer transparently.
+- **Atomic boundary held.** Phase-1 landed as 9 small revertable commits (`1c7d410`, `7dfdef5`, `d12ad1a`, `f90f5f8`, `8498937`, `830c056` rate-limit module, `49ddc63` rate-limit tests, `e78fb24` rate-limit wiring, `62eb9c0` partial doc-sync), with this commit closing the doc-sync. Each independently revertable per the draftplan's "Hard rollback path".
+- **Surprises / deviations from plan:**
+  - Plan said "kept in Phase 1 to avoid a flag-day rollout" re: `X-Session-Token` compat header — we dropped it anyway. Bearer-only from day 1; no compatibility scaffolding needed since the frontend was rewritten in lockstep.
+  - Plan didn't anticipate the `multiprocessing.current_process().name` gate in `app/auth.py` — needed because the rate-limit module's `BucketStore` and the anlz subprocess pool both import `app.auth` transitively at fork time on Linux/macOS, which would have generated a SECOND token (and emitted a SECOND `LMS_TOKEN=` banner to stdout) per worker. Worker subprocesses now get empty string + skip the banner/file-write.
 
 ---
 

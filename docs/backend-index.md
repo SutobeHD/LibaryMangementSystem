@@ -1,13 +1,18 @@
 # app/ INDEX — Python Backend
 
 > Module and endpoint map for the FastAPI backend. Update when adding/removing endpoints or modules.
-> Last updated: 2026-04-30
+> Last updated: 2026-05-17
 
 ---
 
 ## Entry Point & Server Config (`app/main.py`)
 
-FastAPI app (~1700 lines). Security: CORS locked to localhost, session token auth on system endpoints, `validate_audio_path()` enforces `ALLOWED_AUDIO_ROOTS` sandbox on all file I/O.
+FastAPI app (~4000 lines). Security: CORS locked to localhost, `validate_audio_path()` enforces `ALLOWED_AUDIO_ROOTS` sandbox on all file I/O. **Phase-1 Bearer-token auth** (commits `1c7d410..f90f5f8` + `8498937`): every mutation route (POST/PUT/PATCH/DELETE) carries `dependencies=[Depends(require_session)]` from `app/auth.py`. Token is self-generated at sidecar boot (`secrets.token_urlsafe(32)`), printed once as `LMS_TOKEN=<value>` on stdout (captured + scrubbed by Tauri Rust supervisor), and persisted to `%APPDATA%/MusicLibraryManager/.session-token` for the browser-dev fallback. Clients must send `Authorization: Bearer <token>` on every gated request — see `app/auth.py:require_session`. 84/85 mutation routes gated; `POST /api/system/heartbeat` is the only intentional exception (unauth healthcheck). **Phase-1 rate-limit** (`app/rate_limit.py`, commit `e78fb24`): the 3 HIGH-tier routes (shutdown / restart / sc-auth-token) additionally carry `@rate_limit(steady=5.0, burst=10, key_mode="both")`.
+
+Marker convention in the route tables below:
+- `[AUTH]` — requires `Authorization: Bearer <SESSION_TOKEN>`. Missing/wrong → 401.
+- `[RL]` — gated by `@rate_limit` in addition to `[AUTH]`. Excess → 429 with `Retry-After` header.
+- Unmarked rows are open (read-only or heartbeat).
 
 ### Library Endpoints
 | Method | Path | Description |
@@ -17,13 +22,13 @@ FastAPI app (~1700 lines). Security: CORS locked to localhost, session token aut
 | GET | `/api/track/{tid}` | Single track full detail |
 | GET | `/api/track/{tid}/cues` | Hot cues + memory cues for a track |
 | GET | `/api/track/{tid}/beatgrid` | Beatgrid data for a track |
-| POST | `/api/track/{tid}` | Update track metadata fields |
-| DELETE | `/api/track/{tid}` | Delete a track |
-| POST | `/api/track/delete` | Delete track by body param |
-| POST | `/api/track/cues/save` | Save cue points for a track |
-| POST | `/api/track/grid/save` | Save beatgrid for a track |
-| PATCH | `/api/tracks/batch` | Batch update metadata on multiple tracks |
-| POST | `/api/tracks/move` | Move tracks between playlists |
+| POST | `/api/track/{tid}` `[AUTH]` | Update track metadata fields |
+| DELETE | `/api/track/{tid}` `[AUTH]` | Delete a track |
+| POST | `/api/track/delete` `[AUTH]` | Delete track by body param |
+| POST | `/api/track/cues/save` `[AUTH]` | Save cue points for a track |
+| POST | `/api/track/grid/save` `[AUTH]` | Save beatgrid for a track |
+| PATCH | `/api/tracks/batch` `[AUTH]` | Batch update metadata on multiple tracks |
+| POST | `/api/tracks/move` `[AUTH]` | Move tracks between playlists |
 | GET | `/api/artists` | All artists (normalized) |
 | GET | `/api/artist/{aid}/tracks` | Tracks by artist |
 | GET | `/api/genres` | All genres |
@@ -37,13 +42,17 @@ FastAPI app (~1700 lines). Security: CORS locked to localhost, session token aut
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/playlists/tree` | Full playlist tree (nested folders + playlists) |
-| POST | `/api/playlists/create` | Create new playlist |
-| POST | `/api/playlists/rename` | Rename playlist |
-| POST | `/api/playlists/move` | Move playlist in tree |
-| POST | `/api/playlists/delete` | Delete playlist |
-| POST | `/api/playlists/add-track` | Add track to playlist |
-| POST | `/api/playlists/remove-track` | Remove track from playlist |
-| POST | `/api/playlists/reorder` | Reorder tracks within playlist |
+| POST | `/api/playlists/create` `[AUTH]` | Create new playlist |
+| POST | `/api/playlists/rename` `[AUTH]` | Rename playlist |
+| POST | `/api/playlists/move` `[AUTH]` | Move playlist in tree |
+| POST | `/api/playlists/delete` `[AUTH]` | Delete playlist |
+| POST | `/api/playlists/add-track` `[AUTH]` | Add track to playlist |
+| POST | `/api/playlists/remove-track` `[AUTH]` | Remove track from playlist |
+| POST | `/api/playlists/reorder` `[AUTH]` | Reorder tracks within playlist |
+| POST | `/api/playlists/smart/create` `[AUTH]` | Create smart-playlist with rules |
+| POST | `/api/playlists/smart/update` `[AUTH]` | Update smart-playlist rules |
+| GET | `/api/playlists/smart/{pid}/evaluate` | Re-evaluate smart-playlist against current library |
+| POST | `/api/playlists/folder/create` `[AUTH]` | Create folder node in playlist tree |
 
 ### Audio Endpoints
 | Method | Path | Description |
@@ -51,21 +60,21 @@ FastAPI app (~1700 lines). Security: CORS locked to localhost, session token aut
 | GET | `/api/stream` | Stream audio file (range-request, sandboxed, query param `path`) |
 | GET | `/api/audio/stream` | Alias for stream endpoint |
 | GET | `/api/audio/waveform` | Multiband waveform data (pps param controls points-per-second) |
-| POST | `/api/audio/analyze` | Start async BPM/key analysis → returns `{ task_id }` |
+| POST | `/api/audio/analyze` `[AUTH]` | Start async BPM/key analysis → returns `{ task_id }` |
 | GET | `/api/audio/analyze/{task_id}` | Poll analysis result: `{ status, bpm, key, confidence }` |
-| POST | `/api/audio/slice` | Slice audio file at beat positions |
-| POST | `/api/audio/render` | Render audio with FFmpeg (format conversion, export) |
-| POST | `/api/audio/import` | Import a local audio file into the library |
-| POST | `/api/track/{tid}/analyze` | Full analysis pipeline on single track |
-| POST | `/api/track/{tid}/analyze-full` | **[NEW]** Analyze + write ANLZ files + update master.db in one call. Body: `{ force: bool }`. Requires live DB mode, Rekordbox must be closed |
-| POST | `/api/library/analyze-batch` | **[NEW]** Batch analyze multiple tracks; NDJSON streaming progress. Body: `{ track_ids: [int], force: bool }` |
-| GET | `/api/library/analyze-status` | **[NEW]** Report analysis engine capabilities + count of unanalyzed tracks |
+| POST | `/api/audio/slice` `[AUTH]` | Slice audio file at beat positions |
+| POST | `/api/audio/render` `[AUTH]` | Render audio with FFmpeg (format conversion, export) |
+| POST | `/api/audio/import` `[AUTH]` | Import a local audio file into the library |
+| POST | `/api/track/{tid}/analyze` `[AUTH]` | Full analysis pipeline on single track |
+| POST | `/api/track/{tid}/analyze-full` `[AUTH]` | Analyze + write ANLZ files + update master.db in one call. Body: `{ force: bool }`. Requires live DB mode, Rekordbox must be closed |
+| POST | `/api/library/analyze-batch` `[AUTH]` | Batch analyze multiple tracks; NDJSON streaming progress. Body: `{ track_ids: [int], force: bool }` |
+| GET | `/api/library/analyze-status` | Report analysis engine capabilities + count of unanalyzed tracks |
 
 ### Project (DAW / RBEP) Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/projects` | List `.rbep` project files |
-| POST | `/api/projects/save` | Save non-destructive edit project to `.rbep` |
+| POST | `/api/projects/save` `[AUTH]` | Save non-destructive edit project to `.rbep` |
 | GET | `/api/projects/{name}` | Load and parse a specific `.rbep` project |
 | GET | `/api/projects/rbep/list` | List available `.rbep` files |
 | GET | `/api/projects/rbep/{name}` | Get parsed content of a `.rbep` project |
@@ -74,23 +83,30 @@ FastAPI app (~1700 lines). Security: CORS locked to localhost, session token aut
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/library/status` | Library load state, mode (XML/live), path |
-| POST | `/api/library/mode` | Switch between XML and live (SQLite) mode |
-| POST | `/api/library/load` | Load a Rekordbox XML file into memory |
-| POST | `/api/library/unload` | Unload current library |
-| POST | `/api/library/new` | Create a new empty library |
-| POST | `/api/library/sync` | Persist current state (XML mode writes rekordbox.xml; live mode is a no-op) |
-| POST | `/api/library/smart-playlists` | Generate smart playlists from rules |
-| POST | `/api/library/scan-folder` | **[NEW]** Background scan of a directory; auto-imports audio files not yet in library. Body: `{ path: str }` |
-| POST | `/api/library/clean-titles` | Clean track title strings (remove tags, fix encoding) |
-| POST | `/api/debug/load_xml` | Debug endpoint: reload XML from disk |
+| POST | `/api/library/mode` `[AUTH]` | Switch between XML and live (SQLite) mode |
+| POST | `/api/library/load` `[AUTH]` | Load a Rekordbox XML file into memory |
+| POST | `/api/library/unload` `[AUTH]` | Unload current library |
+| POST | `/api/library/new` `[AUTH]` | Create a new empty library |
+| POST | `/api/library/sync` `[AUTH]` | Persist current state (XML mode writes rekordbox.xml; live mode is a no-op) |
+| POST | `/api/library/smart-playlists` `[AUTH]` | Generate smart playlists from rules |
+| POST | `/api/library/scan-folder` `[AUTH]` | Background scan of a directory; auto-imports audio files not yet in library. Body: `{ path: str }` |
+| POST | `/api/library/import-paths` `[AUTH]` | Bulk-import a list of explicit file paths |
+| POST | `/api/library/clean-titles` `[AUTH]` | Clean track title strings (remove tags, fix encoding) |
+| GET | `/api/library/folder-watcher/status` | Report active folder-watcher state |
+| POST | `/api/library/folder-watcher/add` `[AUTH]` | Register a folder for auto-watch + auto-import |
+| POST | `/api/library/folder-watcher/remove` `[AUTH]` | Stop watching a folder |
+| GET | `/api/import/tasks` | List pending/completed import tasks |
+| POST | `/api/import/tasks/clear` `[AUTH]` | Clear completed import tasks |
+| POST | `/api/debug/load_xml` `[AUTH]` | Debug endpoint: reload XML from disk |
 
 ### Rekordbox XML Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/xml/clean` | Clean Rekordbox XML (strip tags, fix encoding, normalize) |
-| POST | `/api/rekordbox/export` | Export selected tracks to Rekordbox-compatible XML |
-| POST | `/api/rekordbox/import` | Import tracks from a Rekordbox XML export |
-| POST | `/api/file/write` | Write raw XML content to a file (sandboxed) |
+| POST | `/api/xml/clean` `[AUTH]` | Clean Rekordbox XML (strip tags, fix encoding, normalize) |
+| POST | `/api/rekordbox/export` `[AUTH]` | Export selected tracks to Rekordbox-compatible XML |
+| POST | `/api/rekordbox/import` `[AUTH]` | Import tracks from a Rekordbox XML export |
+| POST | `/api/file/write` `[AUTH]` | Write raw XML content to a file (sandboxed) |
+| POST | `/api/file/reveal` `[AUTH]` | Open OS file-manager at the given sandboxed path |
 
 ### Insights Endpoints
 | Method | Path | Description |
@@ -103,61 +119,68 @@ FastAPI app (~1700 lines). Security: CORS locked to localhost, session token aut
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/tools/duplicates` | Find duplicate tracks (title + artist matching) |
-| POST | `/api/tools/duplicates/merge` | Merge a set of duplicate tracks |
-| POST | `/api/tools/duplicates/merge-all` | Auto-merge all detected duplicates |
-| POST | `/api/tools/rename` | Rename tracks (not supported in XML-only mode) |
-| POST | `/api/tools/batch-comment` | Batch update comments on multiple tracks |
-| POST | `/api/metadata/merge` | Merge metadata from one track into another |
+| POST | `/api/tools/duplicates/merge` `[AUTH]` | Merge a set of duplicate tracks |
+| POST | `/api/tools/duplicates/merge-all` `[AUTH]` | Auto-merge all detected duplicates |
+| POST | `/api/tools/rename` `[AUTH]` | Rename tracks (not supported in XML-only mode) |
+| POST | `/api/tools/batch-comment` `[AUTH]` | Batch update comments on multiple tracks |
+| POST | `/api/metadata/merge` `[AUTH]` | Merge metadata from one track into another |
 
 ### SoundCloud Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/soundcloud/playlists` | Fetch SC playlists for authenticated user |
 | GET | `/api/soundcloud/me` | Get authenticated SC user profile |
-| POST | `/api/soundcloud/auth-token` | Store SC OAuth token (called after Tauri OAuth flow) |
+| POST | `/api/soundcloud/auth-token` `[AUTH]` `[RL]` | Store SC OAuth token (called after Tauri OAuth flow). Rate-limited: 5 req/min steady, burst 10, `key_mode="both"`. |
 | GET | `/api/soundcloud/settings` | Get SC-specific settings (target folder, etc.) |
-| PUT | `/api/soundcloud/settings` | Update SC settings |
-| POST | `/api/soundcloud/preview-matches` | Preview library matches for SC playlist tracks (dry run) |
-| POST | `/api/soundcloud/sync` | Run SC playlist sync (match + mark) |
-| POST | `/api/soundcloud/sync-all` | Sync all SC playlists at once |
-| POST | `/api/soundcloud/merge` | Merge SC playlist into local playlist |
-| POST | `/api/soundcloud/download` | **[UPDATED]** Start legal download: body `ScDownloadRequest`. Accepts URL or pre-resolved track data. Rejects if `downloadable=false`. Uses official SC API only. Returns `{task_id}`. |
+| PUT | `/api/soundcloud/settings` `[AUTH]` | Update SC settings |
+| POST | `/api/soundcloud/preview-matches` `[AUTH]` | Preview library matches for SC playlist tracks (dry run) |
+| POST | `/api/soundcloud/sync` `[AUTH]` | Run SC playlist sync (match + mark) |
+| POST | `/api/soundcloud/sync-all` `[AUTH]` | Sync all SC playlists at once |
+| POST | `/api/soundcloud/merge` `[AUTH]` | Merge SC playlist into local playlist |
+| POST | `/api/soundcloud/download` `[AUTH]` | Start legal download: body `ScDownloadRequest`. Accepts URL or pre-resolved track data. Rejects if `downloadable=false`. Uses official SC API only. Returns `{task_id}`. |
+| POST | `/api/soundcloud/download-playlist` `[AUTH]` | Bulk-download every track in an SC playlist |
 | GET | `/api/soundcloud/tasks` | List all active download tasks |
 | GET | `/api/soundcloud/task/{task_id}` | Poll status of a download task |
-| GET | `/api/soundcloud/history` | **[NEW]** Paginated analysis history log. Params: `limit`, `offset`, `status`, `device_id`, `search`, `this_device_only` |
-| GET | `/api/soundcloud/history/stats` | **[NEW]** Aggregate stats: total/analyzed/failed counts, device count, date range |
-| GET | `/api/soundcloud/check/{sc_track_id}` | **[NEW]** O(1) dedup check — returns `{already_downloaded: bool}` |
-| DELETE | `/api/soundcloud/history/{sc_track_id}` | **[NEW]** Remove registry entry (to allow re-download). Does NOT delete the file. |
-| POST | `/api/artist/soundcloud` | Associate artist with SC profile |
+| GET | `/api/soundcloud/history` | Paginated analysis history log. Params: `limit`, `offset`, `status`, `device_id`, `search`, `this_device_only` |
+| GET | `/api/soundcloud/history/stats` | Aggregate stats: total/analyzed/failed counts, device count, date range |
+| GET | `/api/soundcloud/check/{sc_track_id}` | O(1) dedup check — returns `{already_downloaded: bool}` |
+| DELETE | `/api/soundcloud/history/{sc_track_id}` `[AUTH]` | Remove registry entry (to allow re-download). Does NOT delete the file. |
+| POST | `/api/artist/soundcloud` `[AUTH]` | Associate artist with SC profile |
 
 ### USB Sync Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/usb/devices` | Scan drives for Rekordbox USB libraries |
 | GET | `/api/usb/profiles` | List all sync profiles |
-| POST | `/api/usb/profiles` | Save/update a sync profile |
-| DELETE | `/api/usb/profiles/{device_id}` | Delete a sync profile |
+| POST | `/api/usb/profiles` `[AUTH]` | Save/update a sync profile |
+| DELETE | `/api/usb/profiles/{device_id}` `[AUTH]` | Delete a sync profile |
+| POST | `/api/usb/profiles/prune` `[AUTH]` | Drop sync profiles for devices no longer present |
 | GET | `/api/usb/{device_id}/contents` | List tracks/playlists on USB device |
 | GET | `/api/usb/diff/{device_id}` | Calculate diff: what would change in a sync |
-| POST | `/api/usb/sync` | Run USB sync for specific playlists (long-running, no timeout — can take minutes for large libraries) |
-| POST | `/api/usb/sync/all` | Sync entire local library to USB |
-| POST | `/api/usb/eject` | Eject a USB device |
-| POST | `/api/usb/reset` | Reset USB library to factory state |
-| POST | `/api/usb/initialize` | Initialize a drive as a Rekordbox USB |
-| POST | `/api/usb/rename` | Rename a USB device profile |
+| POST | `/api/usb/sync` `[AUTH]` | Run USB sync for specific playlists (long-running, no timeout — can take minutes for large libraries) |
+| POST | `/api/usb/sync/all` `[AUTH]` | Sync entire local library to USB |
+| POST | `/api/usb/eject` `[AUTH]` | Eject a USB device |
+| POST | `/api/usb/reset` `[AUTH]` | Reset USB library to factory state |
+| POST | `/api/usb/initialize` `[AUTH]` | Initialize a drive as a Rekordbox USB |
+| POST | `/api/usb/rename` `[AUTH]` | Rename a USB device profile |
 | GET | `/api/usb/settings` | Get USB sync global settings |
-| POST | `/api/usb/settings` | Update USB sync global settings |
+| POST | `/api/usb/settings` `[AUTH]` | Update USB sync global settings |
+| POST | `/api/usb/history` `[AUTH]` | Append a sync-history entry |
+| GET | `/api/usb/mysettings/schema` | Hardware-settings field schema (dropdowns/enums) |
+| GET | `/api/usb/mysettings/{device_id}` | Read CDJ/DJM settings from a USB device |
+| POST | `/api/usb/mysettings` `[AUTH]` | Write CDJ/DJM settings to a USB device |
+| POST | `/api/usb/format/preview` `[AUTH]` | Dry-run preview of a USB format operation |
+| POST | `/api/usb/format/confirm` `[AUTH]` | Execute a USB format operation |
 
 ### System Endpoints
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/settings` | Load user settings (JSON) |
-| POST | `/api/settings` | Save user settings |
-| POST | `/api/system/heartbeat` | Keep-alive ping (called on startup) |
-| POST | `/api/system/shutdown` | Graceful server shutdown |
-| POST | `/api/system/restart` | Restart the backend process |
-| POST | `/api/system/cleanup` | Clean temp files |
-| POST | `/api/system/select_db` | Open file dialog to select Rekordbox DB |
+| POST | `/api/settings` `[AUTH]` | Save user settings |
+| POST | `/api/system/heartbeat` | Keep-alive ping (called on startup). **Intentional Phase-1 exception** — the only unauth'd mutation endpoint. No body, no token leak (the old `SHUTDOWN_TOKEN` scheme was deleted in commit `7dfdef5`). |
+| POST | `/api/system/shutdown` `[AUTH]` `[RL]` | Graceful server shutdown. Rate-limited: 5 req/min steady, burst 10, `key_mode="both"` (per-IP + per-bearer). |
+| POST | `/api/system/restart` `[AUTH]` `[RL]` | Restart the backend process. Rate-limited: 5 req/min steady, burst 10, `key_mode="both"`. |
+| POST | `/api/system/select_db` `[AUTH]` | Open file dialog to select Rekordbox DB |
 
 ---
 
@@ -464,7 +487,7 @@ New module for three-way play-count diffing between PC and USB.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/usb/playcount/diff` | Diff PC vs USB play counts |
-| POST | `/api/usb/playcount/resolve` | Commit resolved play counts |
+| POST | `/api/usb/playcount/resolve` `[AUTH]` | Commit resolved play counts |
 
 ---
 
@@ -480,8 +503,8 @@ New module for three-way play-count diffing between PC and USB.
 **API endpoints added to `app/main.py`**:
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/phrase/generate` | Generate phrase cues from beat grid |
-| POST | `/api/phrase/commit` | Write hot cues to Rekordbox DB |
+| POST | `/api/phrase/generate` `[AUTH]` | Generate phrase cues from beat grid |
+| POST | `/api/phrase/commit` `[AUTH]` | Write hot cues to Rekordbox DB |
 
 ---
 
@@ -492,6 +515,77 @@ Background job system with Python fallback fingerprinting (librosa PCM / MD5).
 **API endpoints added to `app/main.py`**:
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/duplicates/scan` | Start background fingerprint scan, returns `job_id` |
+| POST | `/api/duplicates/scan` `[AUTH]` | Start background fingerprint scan, returns `job_id` |
 | GET | `/api/duplicates/results` | Poll scan status/results |
-| POST | `/api/duplicates/merge` | Merge duplicate tracks in library |
+| POST | `/api/duplicates/merge` `[AUTH]` | Merge duplicate tracks in library |
+
+---
+
+## MyTags Endpoints
+
+Per-track tag taxonomy (orthogonal to genres). Stored in `master.db.djmdMyTag` + `djmdSongMyTag`.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/mytags` | List all tag definitions |
+| POST | `/api/mytags` `[AUTH]` | Create new tag definition |
+| DELETE | `/api/mytags/{tag_id}` `[AUTH]` | Delete tag definition + cascade unlink |
+| GET | `/api/track/{tid}/mytags` | Tags applied to a single track |
+| POST | `/api/track/{tid}/mytags` `[AUTH]` | Replace the tag set on a track |
+
+---
+
+## Insights Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/insights/low_quality` | Tracks below bitrate/quality threshold |
+| GET | `/api/insights/no_artwork` | Tracks missing embedded artwork |
+| GET | `/api/insights/lost` | Tracks whose file paths no longer exist on disk |
+
+---
+
+## Authentication (`app/auth.py`)
+
+Phase-1 Bearer-token gate for every mutation route. Token rotates only on sidecar process restart.
+
+| Symbol | Returns | Description |
+|--------|---------|-------------|
+| `SESSION_TOKEN` | `str` | Boot-time token (`secrets.token_urlsafe(32)`). Empty in worker subprocesses (rate-limit pool, anlz worker) — only the main process generates + emits the banner. |
+| `require_session(authorization)` | `None` | FastAPI dependency. Parses `Authorization: Bearer <token>`, compares against `SESSION_TOKEN` via `safe_compare`. Raises `HTTPException(401, "Unauthorized")` on any failure (missing header, wrong scheme, length mismatch, value mismatch). **Never logs the token at any level.** |
+| `_token_file_path()` | `Path` | Resolves `<user_data_dir>/MusicLibraryManager/.session-token` cross-platform via `platformdirs`. Browser-dev path reads from this; Tauri reads from stdout instead. |
+| `_write_token_file(token)` | `Path` | Persist token to user-data dir; best-effort `chmod 0o600` on POSIX. |
+| `_emit_boot_banner(token)` | `None` | Write `LMS_TOKEN=<value>\n` to stdout once at import time. Tauri Rust supervisor's stdout reader matches the prefix, stores the value in a `Mutex<String>`, and drops the line from the forwarded log stream. |
+
+Wire-protocol: every mutation route declares `dependencies=[Depends(require_session)]`. The frontend's axios interceptor (`frontend/src/api/api.js`) blocks on a bootstrap promise that fetches the token via Tauri IPC (`get_session_token`) or the Vite dev-middleware (`GET /dev-token`), then attaches `Authorization: Bearer <token>` to every request.
+
+---
+
+## Constant-Time Compare (`app/security_compare.py`)
+
+Hardened wrapper around `secrets.compare_digest` for token / HMAC equality.
+
+| Symbol | Returns | Description |
+|--------|---------|-------------|
+| `safe_compare(presented, expected)` | `bool` | Constant-time equality. Returns `False` (never raises) for non-`(str\|bytes)` inputs, non-ASCII `str`, mixed `str`/`bytes`, length mismatch — the five fragility cases from the codebase audit (see `docs/research/research/evaluated_security-secrets-compare-digest-codebase-audit.md`). Trust direction is part of the public contract: `presented` is untrusted (request-side), `expected` is canonical (server-side). |
+
+---
+
+## Rate Limiting (`app/rate_limit.py`)
+
+Phase-1 deliverable from `docs/research/research/evaluated_security-rate-limit-design.md`. Module shipped and applied to the 3 HIGH-tier routes per the Recommendation block.
+
+| Symbol | Returns | Description |
+|--------|---------|-------------|
+| `TokenBucket(steady_per_min, burst)` | instance | Single-key bucket with monotonic-clock refill. `take()` → `(allowed, retry_after_s)`. |
+| `BucketStore` | instance | Process-wide TTL'd dict keyed by `make_key()` output. Lazy purge (60s sweep interval, 600s idle TTL). RLock-guarded mutation. |
+| `make_key(request, mode)` | `str` | Derive bucket-key from request. Loopback IPs (`127.0.0.1`, `::1`) short-circuit to `"__whitelist__"` sentinel — Phase-1 sidecar binds to loopback so every real request bypasses the limiter today. `mode` ∈ `{"ip", "bearer", "both"}`. |
+| `rate_limit(steady, burst, key_mode)` | decorator | Wraps an async FastAPI handler with a per-key gate. On miss raises `HTTPException(429, {"error": "rate_limited", "retry_after_s": int})` plus a `Retry-After` header. |
+| `_store` | `BucketStore` | Module-level singleton; exposed for tests to reset between cases. |
+
+**Currently applied to** (all `steady=5.0, burst=10, key_mode="both"`):
+- `POST /api/system/shutdown`
+- `POST /api/system/restart`
+- `POST /api/soundcloud/auth-token`
+
+Decorator order: `@app.post(...)` outermost → `@rate_limit(...)` inner → `Depends(require_session)` via `dependencies=` kwarg on the `@app.post`, so `require_session` raises 401 before the bucket is decremented (verified by `tests/test_rate_limit.py::test_auth_before_ratelimit`). Remaining MEDIUM/LOW-tier wiring is Phase-2 work.
