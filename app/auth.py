@@ -36,13 +36,12 @@ from typing import Annotated
 from fastapi import Header, HTTPException
 from platformdirs import user_data_dir
 
+from app.security_compare import safe_compare
+
 logger = logging.getLogger("APP_AUTH")
 
 _APP_DIRNAME = "MusicLibraryManager"
 _TOKEN_FILENAME = ".session-token"
-
-_CTRL_DEL = 0x7F
-_CTRL_MAX = 0x20
 
 
 def _token_file_path() -> Path:
@@ -112,12 +111,5 @@ def require_session(
     if not candidate:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if any(ord(c) < _CTRL_MAX or ord(c) == _CTRL_DEL for c in candidate):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    expected = SESSION_TOKEN
-    if not expected or len(candidate) != len(expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if not secrets.compare_digest(candidate, expected):
+    if not safe_compare(candidate, SESSION_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
