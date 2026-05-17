@@ -19,6 +19,7 @@ related: [analysis-remix-detector, library-extended-remix-finder, library-qualit
 - 2026-05-15 — research/idea_ — exploring_-ready rework loop (deep self-review pass)
 - 2026-05-15 — research/exploring_ — promoted; quality bar met (caught load-bearing rapidfuzz cross-doc error AND flagged sister-docs for fixup; 8/11 OQ resolved-M1; 5 dated Findings with module-API design specifics)
 - 2026-05-17 — research/exploring_ — evaluated_-ready rework loop (re-verified `SequenceMatcher` + `fingerprint.rs` + `backend.spec`; cross-doc taxonomy alignment pass across 4 sister-docs; added Rust-FP-via-IPC option for M1; added canonical `VersionTag.label` enum + classifier-input table; added pre-evaluated_ checklist with sign-off blockers)
+- 2026-05-17 — research/exploring_ — higher-quality-bar rework (implementation-ready bar)
 
 ---
 
@@ -213,6 +214,239 @@ Re-verified 2026-05-17 (each `Grep`/`Read` against current main):
 - **`_db_write_lock`** at `app/database.py:22` (verified by sister-doc quality-upgrade-finder 2026-05-15). Module read-only — no acquisition.
 
 No verification has fallen out. All Constraints assertions remain true on main.
+
+### 2026-05-17 — implementation-ready bar: test signatures + Options scoring + first-30-LoC pseudocode + git-diff prose
+
+**Empirical re-verify (each Read against current `main` 2026-05-17):**
+
+- `app/soundcloud_api.py:16` — `from difflib import SequenceMatcher`. STDLIB-only matcher confirmed.
+- `app/soundcloud_api.py:550` — `class SoundCloudSyncEngine:`. Bound.
+- `app/soundcloud_api.py:558-559` — `_normalize_title` body literally `return re.sub(r'[^\w\s]', '', title.lower().strip())`. Stateless, mechanical lift.
+- `app/soundcloud_api.py:566` — `def _fuzzy_match_with_score(self, sc_title, sc_artist, local_tracks):` body lines 567-587.
+- `app/soundcloud_api.py:579-580` — exact-norm-title shortcut `return tid, 1.0`. Confirmed.
+- `app/soundcloud_api.py:582-583` — `ratio = SequenceMatcher(None, sc_combined, local_combined).ratio()` + `if ratio > best_ratio and ratio >= 0.65`. Confirmed.
+- `app/soundcloud_api.py:587` — return shape `(best_match, round(best_ratio, 3))`. Confirmed.
+- `app/database.py:22` — `_db_write_lock = threading.RLock()`. Confirmed.
+- `app/database.py:26-40` — public `db_lock()` `@contextmanager`. Confirmed.
+- `app/database.py:43-53` — private `_serialised` decorator. Confirmed.
+- `Grep backend.spec` for `fpcalc|chromaprint|acoustid|pyacoustid` → zero matches. PATH-detect plan holds.
+- `src-tauri/src/audio/fingerprint.rs:287-302` — `pub fn hamming_similarity(a: &[u32], b: &[u32]) -> Option<f32>`, `MIN_FP_LEN=4`. Confirmed.
+- `src-tauri/src/audio/fingerprint.rs:320-334` — `pub async fn fingerprint_track(path: String) -> Result<Vec<u32>, String>`. **No `window` arg** — sidecar-callable IF Python could hit Tauri command surface (it can't). Confirmed signature.
+- `src-tauri/src/audio/fingerprint.rs:343-398` — `pub async fn fingerprint_batch(paths: Vec<String>, window: tauri::Window) -> Result<HashMap<String, Vec<u32>>, String>`. `tauri::Window` injection ties batch-call to a frontend window — Python sidecar has no window handle. Confirmed.
+- `Glob app/external_track_match*` → empty. Greenfield path.
+- `tests/test_soundcloud_api.py:17-22` — import shape `from app.soundcloud_api import (AuthExpiredError, RateLimitError, SoundCloudSyncEngine, _sc_get)`. M1 must preserve this surface.
+
+**EXACT test signatures for `tests/test_external_track_match.py` (M1 acceptance gate):**
+
+Module is read-only + stateless except `ADAPTER_REGISTRY` dict. Tests use `pytest` (already wired) + `monkeypatch` (no new dev deps). Fixture file path `tests/fixtures/external_track_match/titles_corpus.yaml` (corpus = 200+ title cases; YAML loader via `PyYAML` — already pinned).
+
+```python
+# Pure functions
+def test_normalize_title_lowercases_and_strips_punct():
+    """normalize_title('Strobe!') == 'strobe' — mirrors _normalize_title at app/soundcloud_api.py:559."""
+
+def test_normalize_title_handles_accents():
+    """normalize_title('Pacífico') == 'pacifico' — NFD-fold (new vs current stdlib behaviour; gate)."""
+
+def test_extract_title_stem_strips_paren_suffix():
+    """extract_title_stem('Strobe (Radio Edit)') == 'strobe'."""
+
+def test_extract_title_stem_strips_bracket_suffix():
+    """extract_title_stem('Strobe [Extended Mix]') == 'strobe'."""
+
+def test_extract_title_stem_strips_trailing_dash_variant():
+    """extract_title_stem('Strobe - Extended Mix') == 'strobe'."""
+
+def test_extract_title_stem_drops_feat_by_default():
+    """extract_title_stem('Song feat. X') == 'song'; with drop_features=False → 'song feat. x'."""
+
+def test_extract_title_stem_round_trip_three_shapes():
+    """All four equivalent stems collapse to same root.
+    extract_title_stem('Strobe (Radio Edit)') == extract_title_stem('Strobe - Extended Mix')
+        == extract_title_stem('Strobe (Deadmau5 Club Mix)') == 'strobe'.
+    """
+
+@pytest.mark.parametrize("title,expected_label", [...])  # ≥200 cases from corpus
+def test_parse_version_tag_label_recall(title, expected_label, labelled_titles):
+    """≥95% label recall on 200-title corpus per Goals metric."""
+
+def test_parse_version_tag_captures_remixer():
+    """parse_version_tag('Strobe (Deadmau5 Remix)').remixer == 'Deadmau5'."""
+
+def test_parse_version_tag_captures_year_modifier():
+    """parse_version_tag('Strobe (2024 Edit)').modifiers == ('2024',)."""
+
+def test_parse_version_tag_returns_none_on_no_suffix():
+    """parse_version_tag('Strobe') is None."""
+
+def test_parse_version_tag_canonical_label_set():
+    """All parsed labels in canonical 12-member Literal set."""
+
+# Fuzzy match equivalence vs current SC behaviour (regression-equivalence gate)
+def test_fuzzy_match_with_score_equivalence_to_sc_baseline(sc_baseline_fixture):
+    """For 50 (query, candidates) pairs harvested from SC sync logs, the
+    new module-level fuzzy_match_with_score(...) returns IDENTICAL (tid, round_score)
+    tuples as SoundCloudSyncEngine(db)._fuzzy_match_with_score(...).
+    """
+
+def test_fuzzy_match_with_score_exact_norm_title_returns_one_point_zero():
+    """Mirrors short-circuit at app/soundcloud_api.py:579-580."""
+
+def test_fuzzy_match_with_score_threshold_param_default_065():
+    """Default threshold == 0.65 (matches hardcoded SC value); explicit override accepted."""
+
+def test_fuzzy_match_with_score_no_match_returns_none_zero():
+    """Empty candidates dict → (None, 0.0)."""
+
+# Adapter registry
+def test_register_adapter_idempotent():
+    """Re-registering name=key replaces; no duplicate entry."""
+
+def test_get_adapter_raises_when_missing():
+    """get_adapter('nonexistent') raises AdapterNotRegistered."""
+
+def test_list_adapters_returns_registered_names():
+    """Order-independent membership check."""
+
+@pytest.fixture(autouse=True)
+def _reset_registry():
+    """Teardown clears ADAPTER_REGISTRY so test order doesn't leak state."""
+
+# Fingerprint PATH-detect (mock subprocess; no real fpcalc invocation in CI)
+def test_is_fingerprinting_available_true_when_fpcalc_on_path(monkeypatch):
+    """monkeypatch shutil.which('fpcalc') → '/usr/bin/fpcalc'; cached PATH-detect returns True."""
+
+def test_is_fingerprinting_available_false_when_fpcalc_missing(monkeypatch):
+    """monkeypatch shutil.which('fpcalc') → None; cached PATH-detect returns False."""
+
+def test_fingerprint_returns_unavailable_when_fpcalc_missing(monkeypatch):
+    """isinstance(fingerprint(path), FingerprintUnavailable.BinaryMissing) == True."""
+
+def test_fingerprint_validates_audio_path_sandbox(monkeypatch, tmp_path):
+    """path outside ALLOWED_AUDIO_ROOTS → raises ValueError BEFORE subprocess invocation."""
+
+def test_fingerprint_respects_timeout_param(monkeypatch):
+    """Mock subprocess.run records timeout kwarg; assert 10.0 default."""
+
+def test_fingerprint_returns_fingerprint_dataclass_on_success(monkeypatch):
+    """Mock fpcalc stdout returns valid output; result is Fingerprint(fpcalc_hash=..., duration_s=...)."""
+
+# Module-purity gate (read-only invariant)
+def test_module_has_no_db_writer_imports():
+    """grep app/external_track_match.py for '_db_write_lock|pyrekordbox|rbox' → zero matches."""
+```
+
+Total = 22 tests + 1 autouse fixture. Coverage maps to Goals metrics: label-recall (`test_parse_version_tag_label_recall`), stem-extractor round-trip (`test_extract_title_stem_round_trip_three_shapes`), fuzzy-match equivalence (`test_fuzzy_match_with_score_equivalence_to_sc_baseline`), PATH-detect (3 `test_is_fingerprinting_*` + `test_fingerprint_returns_unavailable_*`), adapter registry (`test_register_adapter_idempotent` + `test_get_adapter_raises_when_missing`), read-only invariant (`test_module_has_no_db_writer_imports`).
+
+**Quantified Options table (M1 viability scoring):**
+
+Scoring rubric per criterion 1-5 (5=best). Sums + risk decide.
+
+| Criterion | A flat-functions | B class-DI | C hybrid (fns + reg) | D subpackage |
+|---|---:|---:|---:|---:|
+| **Effort M1** (LoC, days; 5 = lowest) | 5 (~400 LoC, 1 d) | 3 (~700 LoC, 2 d) | 5 (~500 LoC, 1.5 d) | 2 (~900 LoC scaffold + ~500 LoC content, 3 d) |
+| **Migration cost A→C or A→D later** (5 = cheapest) | 5 (in-place add registry dict) | 2 (back-out class wrapper) | 5 (already there) | 1 (already paid; reverse path absurd) |
+| **Test friction** (5 = cleanest fixtures) | 5 (pure fns) | 3 (instance per test) | 4 (autouse reset_registry) | 4 (per-submodule isolated) |
+| **Import latency for one-helper callers** (5 = fastest cold-import) | 5 (import 1 sym) | 3 (instantiate class) | 4 (registry init at import) | 4 (re-export hop) |
+| **Adapter plugin slot quality** (5 = clean DI) | 1 (none on day 1) | 5 (constructor inject) | 4 (registry dict + `register_adapter`) | 5 (subpackage `adapters/`) |
+| **Pre-M3 over-engineering** (5 = least premature) | 5 (zero scaffold) | 2 (class for 1-2 adapter case) | 4 (registry dict cheap) | 1 (4+ submodules with 1-2 used) |
+| **Risk if N>3 sister-features land** (5 = scales best) | 2 (refactor to class or sub-package forced) | 4 (clean DI scales) | 4 (promotion gates fire, move to D) | 5 (already structured) |
+| **TOTAL** (max 35) | **28** | **22** | **30** | **22** |
+
+C wins by 2 points over A, 8 over B/D. Result reproduces Recommendation pick. Tie-break A vs C: C buys plugin slot for one extra day; A defers it but every sister-feature re-derives one. C dominates.
+
+**Pseudocode for first ~30 LoC of M1 (`app/external_track_match.py` — Protocol shapes + dataclasses + adapter registry skeleton):**
+
+Prose-form (no real code committed); shapes load-bearing for sister-doc consumers.
+
+```
+# app/external_track_match.py
+# (Module header docstring lifts SC matcher to module-level. Read-only.
+#  No master.db writes, no rbox imports.)
+
+# Stdlib imports: dataclasses, typing.Protocol, typing.Literal,
+#   typing.runtime_checkable, functools.lru_cache, re, difflib.SequenceMatcher,
+#   shutil, subprocess, pathlib.Path, logging.
+
+# Logger.
+
+# Public canonical Literal alias:
+#   VersionLabel = Literal["original","extended","radio","club","dub",
+#                          "instrumental","acapella","vip","remix","bootleg",
+#                          "edit","mashup"]
+
+# @dataclass(frozen=True, slots=True)
+# class VersionTag:
+#     label: VersionLabel
+#     remixer: str | None = None
+#     modifiers: tuple[str, ...] = ()
+# (Hashable via frozen + tuple; cheap eq/hash for fixture parametrize.)
+
+# @dataclass(frozen=True, slots=True)
+# class Candidate:
+#     source: str         # adapter name (e.g. "soundcloud")
+#     source_id: str      # adapter-native ID (e.g. SC track ID)
+#     title: str
+#     artist: str
+#     duration_s: float | None
+#     version_tag: VersionTag | None
+#     url: str | None
+#     raw: dict           # adapter-specific escape-hatch payload
+
+# @dataclass(frozen=True, slots=True)
+# class Fingerprint:
+#     fpcalc_hash: str
+#     duration_s: float
+
+# Sentinel union for fingerprint failure (importable singletons):
+#   class FingerprintUnavailable:
+#       class BinaryMissing: ...
+#       class Timeout: ...
+#       class DecodeError: ...
+
+# Error hierarchy:
+#   class AdapterError(Exception): ...
+#   class AdapterNotRegistered(AdapterError): ...
+#   class AdapterTransportError(AdapterError): ...
+#   class AdapterQuotaExceeded(AdapterError): ...
+#   class AdapterParseError(AdapterError): ...
+
+# @runtime_checkable
+# class SourcePlugin(Protocol):
+#     name: str
+#     async def search(self, title: str, artist: str, duration_s: float | None = None,
+#                      *, max_results: int = 20) -> list[Candidate]: ...
+#     def parse_version(self, raw: dict) -> VersionTag | None: ...
+#     def quota_remaining(self) -> int | None: ...
+
+# Module-level registry singleton (mutated at adapter import / boot):
+#   ADAPTER_REGISTRY: dict[str, SourcePlugin] = {}
+#   def register_adapter(name: str, plugin: SourcePlugin) -> None:
+#       ADAPTER_REGISTRY[name] = plugin   # idempotent replace
+#   def get_adapter(name: str) -> SourcePlugin:
+#       try: return ADAPTER_REGISTRY[name]
+#       except KeyError: raise AdapterNotRegistered(name)
+#   def list_adapters() -> list[str]:
+#       return list(ADAPTER_REGISTRY.keys())
+```
+
+First ~30 LoC = imports + `VersionLabel` Literal + 3 frozen dataclasses + `FingerprintUnavailable` sentinel + 4 `AdapterError` subclasses + `SourcePlugin` Protocol + registry dict + 3 registry mutators. Pure-function ops (`normalize_title`, `extract_title_stem`, `parse_version_tag`, `fuzzy_match_with_score`, `fingerprint`, `is_fingerprinting_available`) follow after the skeleton. Total M1 file = ~400-500 LoC (well under 800 LoC cap before subpackage migration triggers).
+
+**Git-diff prose (M1 commit-level surface):**
+
+This doc does not commit code; the following prose describes what M1 commit will mutate.
+
+- **NEW file** `app/external_track_match.py` — ~400-500 LoC. Public surface: `normalize_title`, `extract_title_stem`, `parse_version_tag`, `fuzzy_match_with_score`, `fingerprint`, `is_fingerprinting_available`, `register_adapter`, `get_adapter`, `list_adapters`, `VersionLabel`, `VersionTag`, `Candidate`, `Fingerprint`, `FingerprintUnavailable`, `SourcePlugin`, `AdapterError` hierarchy, `ADAPTER_REGISTRY`.
+- **NEW file** `tests/test_external_track_match.py` — 22 tests per signatures above. Imports `pytest`, `monkeypatch` only. No new dev deps.
+- **NEW file** `tests/fixtures/external_track_match/titles_corpus.yaml` — ≥200 hand-labelled `(title, expected_label, expected_remixer, expected_modifiers)` records harvested from `master.db` (owner manual labelling, ~3 hr work). PyYAML loader (already pinned).
+- **MODIFIED** `app/soundcloud_api.py` — `_fuzzy_match_with_score(self, sc_title, sc_artist, local_tracks)` body at lines 566-587 replaced with single-line delegate `return external_track_match.fuzzy_match_with_score(sc_title, sc_artist, local_tracks)`. `_normalize_title` body at line 558-559 same delegate pattern. Import `from . import external_track_match as etm` added near line 16-19 area. Net diff: -22 LoC body, +2 LoC delegates, +1 LoC import. Behaviour-preserving — existing `tests/test_soundcloud_api.py` regression suite green.
+- **MODIFIED** `docs/FILE_MAP.md` + `docs/MAP.md` + `docs/MAP_L2.md` — new entry for `app/external_track_match.py` via `python scripts/regen_maps.py`.
+- **MODIFIED** `docs/backend-index.md` — no entry (module is internal, no FastAPI route surface in M1).
+- **UNCHANGED** `requirements.txt` — zero new deps (`difflib`, `re`, `subprocess`, `pathlib`, `typing`, `dataclasses`, `functools`, `shutil`, `logging` all stdlib).
+- **UNCHANGED** `backend.spec` — no new binaries (`fpcalc` PATH-detect M1).
+- **UNCHANGED** `src-tauri/**` — Rust-FP-via-IPC is M2 territory per OQ12.
+
+Commit message draft: `feat(backend): add app/external_track_match.py — extract SC fuzzy matcher + version-tag taxonomy + adapter registry as shared module (M1 of unified-module exploring_)`.
 
 ### 2026-05-15 — module-API: scope boundary + dep footprint
 
