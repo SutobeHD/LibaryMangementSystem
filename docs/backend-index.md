@@ -176,7 +176,7 @@ Marker convention in the route tables below:
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/settings` | Load user settings (JSON) |
-| POST | `/api/settings` `[AUTH]` | Save user settings |
+| POST | `/api/settings` `[AUTH]` | Save user settings. Strict types + size caps via `SetReq._enforce_caps` (8 KB/value, 64 dict-keys, 64-char key, 256 list-items, 1024-char path, 256 KB total). Cap violation → 422 + WARNING log `[settings] POST rejected: keys=N bytes=N offending=K reason=R` (value never logged). |
 | POST | `/api/system/heartbeat` | Keep-alive ping (called on startup). **Intentional Phase-1 exception** — the only unauth'd mutation endpoint. No body, no token leak (the old `SHUTDOWN_TOKEN` scheme was deleted in commit `7dfdef5`). |
 | POST | `/api/system/shutdown` `[AUTH]` `[RL]` | Graceful server shutdown. Rate-limited: 5 req/min steady, burst 10, `key_mode="both"` (per-IP + per-bearer). |
 | POST | `/api/system/restart` `[AUTH]` `[RL]` | Restart the backend process. Rate-limited: 5 req/min steady, burst 10, `key_mode="both"`. |

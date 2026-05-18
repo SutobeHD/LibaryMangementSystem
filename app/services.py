@@ -657,11 +657,63 @@ class SettingsManager:
         "legacy_pdb_stub": False,  # opt-in: write header-only export.pdb for CDJ-2000nxs2 (experimental — see app/usb_pdb.py)
         "scan_folders": [],          # absolute paths watched for new audio files (FolderWatcher)
     }
+    # Caps mirror app/main.py SetReq validator. Load-path is intentionally
+    # tolerant: legacy settings.json files predating the validator must keep
+    # the app bootable. We strip silently (logger.info, not warning) so the
+    # next user-driven Save round-trips a clean payload through SetReq.
+    _LOAD_MAX_KEYS = 64
+    _LOAD_MAX_KEY_LEN = 64
+    _LOAD_MAX_VALUE_BYTES = 8 * 1024
+    _LOAD_MAX_LIST_ITEMS = 256
+
+    @classmethod
+    def _sanitize_loaded(cls, data: dict[str, Any]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in data.items():
+            if not isinstance(k, str) or len(k) > cls._LOAD_MAX_KEY_LEN:
+                logger.info(
+                    "settings: dropped key=%s reason=key_len>%d",
+                    str(k)[:64], cls._LOAD_MAX_KEY_LEN,
+                )
+                continue
+            if isinstance(v, list) and len(v) > cls._LOAD_MAX_LIST_ITEMS:
+                logger.info(
+                    "settings: dropped key=%s reason=list_items>%d",
+                    k, cls._LOAD_MAX_LIST_ITEMS,
+                )
+                continue
+            if isinstance(v, dict) and len(v) > cls._LOAD_MAX_KEYS:
+                logger.info(
+                    "settings: dropped key=%s reason=dict_keys>%d",
+                    k, cls._LOAD_MAX_KEYS,
+                )
+                continue
+            try:
+                size = len(json.dumps(v, separators=(",", ":"), default=str).encode("utf-8"))
+            except (TypeError, ValueError):
+                logger.info("settings: dropped key=%s reason=unserializable", k)
+                continue
+            if size > cls._LOAD_MAX_VALUE_BYTES:
+                logger.info(
+                    "settings: dropped key=%s reason=value_bytes>%d",
+                    k, cls._LOAD_MAX_VALUE_BYTES,
+                )
+                continue
+            out[k] = v
+        return out
+
     @classmethod
     def load(cls) -> dict[str, Any]:
         try:
             with open(cls.CONFIG, encoding="utf-8") as f:
-                return {**cls.DEFAULT, **json.load(f)}
+                raw = json.load(f)
+            if not isinstance(raw, dict):
+                logger.warning(
+                    "services.SettingsManager.load: non-dict payload, using defaults",
+                )
+                return dict(cls.DEFAULT)
+            sanitized = cls._sanitize_loaded(raw)
+            return {**cls.DEFAULT, **sanitized}
         except (OSError, json.JSONDecodeError) as e:
             logger.warning(
                 "services.SettingsManager.load: falling back to defaults — %s", e,

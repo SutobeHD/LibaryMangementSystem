@@ -112,14 +112,21 @@ from .usb_manager import UsbActions, UsbDetector, UsbProfileManager, UsbSyncEngi
 _sync_lock = asyncio.Lock()
 
 # CONFIG LOGGING
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_DIR / "app.log", encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+# Pre-set RedactingFormatter on each handler BEFORE basicConfig so the
+# `if h.formatter is None` guard (CPython 3.13 Lib/logging/__init__.py L110)
+# leaves our scrubbing formatter intact. Same instance on both handlers
+# guarantees the exc_text cache is scrubbed before any handler emits,
+# regardless of callHandlers iteration order.
+from .logging_utils import RedactingFormatter, safe_error_message_str
+
+_log_formatter = RedactingFormatter(
+    fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+_log_file_handler = logging.FileHandler(LOG_DIR / "app.log", encoding='utf-8')
+_log_file_handler.setFormatter(_log_formatter)
+_log_stream_handler = logging.StreamHandler(sys.stdout)
+_log_stream_handler.setFormatter(_log_formatter)
+logging.basicConfig(level=logging.INFO, handlers=[_log_file_handler, _log_stream_handler])
 logger = logging.getLogger("APP_MAIN")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -198,13 +205,13 @@ def validate_audio_path(path_str: str) -> Path:
     return file_path
 
 def safe_error_message(e: Exception) -> str:
-    """Sanitize error messages to avoid leaking internal paths or system info."""
-    msg = str(e)
-    # Strip absolute path prefixes from error messages
-    for sensitive in [APP_DIR, str(Path.home()), os.environ.get('APPDATA', '')]:
-        if sensitive:
-            msg = msg.replace(sensitive, '[...]')
-    return msg
+    """Sanitize error messages to avoid leaking internal paths or system info.
+
+    Delegates to `safe_error_message_str` in `app/logging_utils.py` so the
+    widened path list (incl. `EXPORT_DIR`/`MUSIC_DIR`/`TEMP_DIR`) is shared
+    with the log-write-time `RedactingFormatter`.
+    """
+    return safe_error_message_str(str(e))
 
 # --- SECURITY: CORS locked to localhost only ---
 app.add_middleware(
@@ -309,27 +316,139 @@ class GridReq(BaseModel):
     track_id: str
     beat_grid: list[dict]
 
-class SetReq(BaseModel):
-    # Permissive: the frontend stores arbitrary preference keys (shortcuts,
-    # waveform colors, scan_folders, …). Anything declared explicitly is type-
-    # checked; everything else is preserved verbatim via model_extra.
-    model_config = {"extra": "allow"}
+# Settings-POST hardening — see docs/research/research/evaluated_security-pydantic-extra-allow-blob-write.md
+# Imports are local to this block so the format hook's `ruff check --fix` cannot
+# strip them as "unused" between successive edits.
+import json as _json_caps  # noqa: E402  (kept here to bind the validator's serializer)
+from typing import Annotated as _Annotated  # noqa: E402
+from typing import Literal as _Literal  # noqa: E402
 
-    default_export_format: str = "wav"
-    default_export_dir: str = ""  # User-selectable default folder for audio exports; empty = backend EXPORT_DIR
-    theme: str = "dark"
+from pydantic import Field as _Field  # noqa: E402
+from pydantic import StringConstraints as _SC  # noqa: E402
+from pydantic import model_validator as _mv  # noqa: E402
+
+# Cap constants. Numbers picked from measured 619 B baseline + 14-shortcut max;
+# ~20-400x headroom on every dimension. See evaluated doc Open Questions 2-4, 8.
+MAX_VALUE_BYTES = 8 * 1024
+MAX_DICT_KEYS = 64
+MAX_KEY_LEN = 64
+MAX_LIST_ITEMS = 256
+MAX_PATH_LEN = 1024
+MAX_TOTAL_BYTES = 256 * 1024
+
+
+# Reusable Annotated string aliases for SetReq field declarations.
+_PathStr = _Annotated[str, _SC(max_length=MAX_PATH_LEN)]
+_ShortKey = _Annotated[str, _SC(max_length=MAX_KEY_LEN)]
+_ShortVal = _Annotated[str, _SC(max_length=MAX_VALUE_BYTES)]
+_HexColor = _Annotated[str, _SC(pattern=r"^#[0-9a-fA-F]{6}$", max_length=7)]
+
+
+class SetReq(BaseModel):
+    # Permissive on key set (frontend may evolve preference keys mid-cycle),
+    # but strict on declared types and capped on size to stop blob-write DoS /
+    # namespace-pollution vectors. See module-level MAX_* constants above.
+    model_config = {"extra": "allow", "strict": True}
+
+    default_export_format: _PathStr = "wav"
+    default_export_dir: _PathStr = ""  # User-selectable default folder for audio exports; empty = backend EXPORT_DIR
+    theme: _PathStr = "dark"
     auto_snap: bool = True
-    db_path: str = ""
-    artist_view_threshold: int = 0
-    waveform_visual_mode: str = "blue"
+    db_path: _PathStr = ""
+    artist_view_threshold: int = _Field(default=0, ge=0)
+    waveform_visual_mode: _Literal["blue", "rgb", "3band", "custom"] = "blue"
     hide_streaming: bool = False
     remember_lib_mode: bool = False
-    last_lib_mode: str = "xml"
-    ranking_filter_mode: str = "all"
-    insights_playcount_threshold: int = 0
-    insights_bitrate_threshold: int = 320
-    soundcloud_auth_token: str = ""
-    scan_folders: list[str] = []
+    last_lib_mode: _PathStr = "xml"
+    ranking_filter_mode: _Literal["all", "unrated", "untagged"] = "all"
+    insights_playcount_threshold: int = _Field(default=0, ge=0)
+    insights_bitrate_threshold: int = _Field(default=320, ge=0)
+    soundcloud_auth_token: _PathStr = ""
+    scan_folders: list[_PathStr] = _Field(default_factory=list, max_length=MAX_LIST_ITEMS)
+
+    # Promoted from extras to declared (typed + capped instead of relying
+    # purely on the extras walker). See evaluated doc Step 3.
+    shortcuts: dict[_ShortKey, _ShortVal] | None = None
+    waveform_color_low: _HexColor | None = None
+    waveform_color_mid: _HexColor | None = None
+    waveform_color_high: _HexColor | None = None
+    locale: _Literal["de", "en"] | None = None
+    sc_sync_folder_id: _PathStr | None = None
+    sc_download_format: _Literal["auto", "aiff"] | None = None
+    legacy_pdb_stub: bool | None = None
+
+    @_mv(mode="after")
+    def _enforce_caps(self) -> "SetReq":
+        """Walk declared + extras enforcing per-value / per-dict / per-list /
+        total-payload caps. On rejection log a WARNING with key + reason
+        (NEVER the value) and raise ValueError -- Pydantic turns it into 422.
+        """
+        extras = self.model_extra or {}
+        keys_total = len(type(self).model_fields) + len(extras)
+
+        def _reject(key: str, reason: str, payload_bytes: int = -1) -> None:
+            logger.warning(
+                "[settings] POST rejected: keys=%d bytes=%d offending=%s reason=%s",
+                keys_total,
+                payload_bytes,
+                key,
+                reason,
+            )
+            raise ValueError(f"key={key} reason={reason}")
+
+        # 1. Total serialized payload size guard.
+        try:
+            serialized = _json_caps.dumps(
+                self.model_dump(), separators=(",", ":"), default=str
+            )
+        except (TypeError, ValueError) as exc:
+            _reject("<payload>", f"unserializable ({exc})")
+            return self  # unreachable; _reject raises
+        total_bytes = len(serialized.encode("utf-8"))
+        if total_bytes > MAX_TOTAL_BYTES:
+            _reject("<payload>", f"total>{MAX_TOTAL_BYTES}B", total_bytes)
+
+        def _walk(value: object, depth: int, parent_key: str) -> None:
+            if depth > 2:
+                _reject(parent_key, "depth>2", total_bytes)
+            if isinstance(value, dict):
+                if len(value) > MAX_DICT_KEYS:
+                    _reject(parent_key, f"dict_keys>{MAX_DICT_KEYS}", total_bytes)
+                for k, v in value.items():
+                    if not isinstance(k, str) or len(k) > MAX_KEY_LEN:
+                        _reject(str(k)[:64], f"key_len>{MAX_KEY_LEN}", total_bytes)
+                    _walk(v, depth + 1, f"{parent_key}.{k}" if parent_key else k)
+            elif isinstance(value, list):
+                if len(value) > MAX_LIST_ITEMS:
+                    _reject(parent_key, f"list_items>{MAX_LIST_ITEMS}", total_bytes)
+                for i, item in enumerate(value):
+                    _walk(item, depth + 1, f"{parent_key}[{i}]")
+            else:
+                # Leaf: cap serialized length.
+                try:
+                    leaf = _json_caps.dumps(value, separators=(",", ":"), default=str)
+                except (TypeError, ValueError) as exc:
+                    _reject(parent_key, f"unserializable_leaf ({exc})", total_bytes)
+                    return
+                if len(leaf.encode("utf-8")) > MAX_VALUE_BYTES:
+                    _reject(parent_key, f"value_bytes>{MAX_VALUE_BYTES}", total_bytes)
+
+        # 2. Walk extras (unknown keys flowing through extra: "allow").
+        if len(extras) > MAX_DICT_KEYS:
+            _reject("<extras>", f"extras_keys>{MAX_DICT_KEYS}", total_bytes)
+        for k, v in extras.items():
+            if not isinstance(k, str) or len(k) > MAX_KEY_LEN:
+                _reject(str(k)[:64], f"key_len>{MAX_KEY_LEN}", total_bytes)
+            _walk(v, depth=1, parent_key=k)
+
+        # 3. Walk declared list/dict fields that field-level constraints
+        #    cannot fully express (cross-cutting value-size check).
+        if self.shortcuts is not None:
+            _walk(self.shortcuts, depth=1, parent_key="shortcuts")
+        if self.scan_folders:
+            _walk(self.scan_folders, depth=1, parent_key="scan_folders")
+
+        return self
 
 class SmartPlReq(BaseModel):
     artist_threshold: int = 3
