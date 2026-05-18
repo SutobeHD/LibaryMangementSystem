@@ -11,13 +11,13 @@
 # Schicht A — Hardening 2026: exact versions block silent CVE updates.
 
 # --- Web Framework ---
-fastapi==0.109.0
-uvicorn==0.27.0
-pydantic==2.5.3
-python-multipart==0.0.9
+fastapi==0.136.1
+uvicorn==0.47.0
+pydantic==2.13.4
+python-multipart==0.0.29
 
 # --- HTTP & System ---
-requests==2.33.1
+requests==2.34.2
 psutil==5.9.8
 
 # --- Database ---
@@ -25,13 +25,13 @@ sqlalchemy==2.0.49
 
 # --- Rekordbox library access (master.db, ANLZ, my-tags) ---
 # pyrekordbox is the Python package; runtime symbols import as `rbox`.
-pyrekordbox==0.1.7
+pyrekordbox==0.4.4
 
 # --- Numerical / Audio Analysis (heavy stack — required for beatgrid/key detection) ---
 numpy==1.26.4
-scipy==1.11.4
-numba==0.58.1
-librosa==0.10.1
+scipy==1.15.3
+numba==0.65.1
+librosa==0.11.0
 
 # --- Production beat / key detection ---
 # These two are optional at import time (graceful fallback to librosa)
@@ -41,14 +41,14 @@ madmom==0.16.1
 essentia==2.1b6.dev1110
 
 # --- Utilities ---
-tqdm==4.66.1
+tqdm==4.67.3
 keyring==25.7.0
 python-dotenv==1.2.2
 # Cross-platform user-data-dir resolution for the session-token file
 # (`app/auth.py` writes `%APPDATA%/MusicLibraryManager/.session-token` on
 # Windows, `~/Library/Application Support/MusicLibraryManager/` on macOS,
 # and `~/.local/share/MusicLibraryManager/` on Linux).
-platformdirs==4.2.2
+platformdirs==4.9.6
 
 # --- Audio I/O ---
 soundfile==0.13.1
@@ -58,7 +58,7 @@ lameenc==1.8.2
 mutagen==1.47.0
 
 # --- Loudness (ITU-R BS.1770 / EBU R128) ---
-pyloudnorm==0.1.1
+pyloudnorm==0.2.0
 
 # --- Filesystem watcher (auto-import on folder change) ---
 watchdog==4.0.2
