@@ -557,11 +557,15 @@ class FileRevealReq(BaseModel):
 
 @app.post("/api/file/reveal", dependencies=[Depends(require_session)])
 def file_reveal(r: FileRevealReq):
-    """Open the OS file explorer pointing at the given file/folder path."""
+    """Open the OS file explorer pointing at the given audio file path.
+
+    SECURITY: the path is sandboxed via ``validate_audio_path`` so any
+    authenticated caller can only reveal **audio files** inside
+    ``ALLOWED_AUDIO_ROOTS`` (or paths already known to ``db.tracks``).
+    See docs/research/research/evaluated_security-api-file-reveal-sandbox.md.
+    """
     try:
-        p = Path(r.path)
-        if not p.exists():
-            raise HTTPException(404, f"Not found: {r.path}")
+        p = validate_audio_path(r.path)
         import subprocess
         import sys
         if sys.platform == "win32":
