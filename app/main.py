@@ -1,5 +1,4 @@
 import asyncio
-import json as _json_caps
 import logging
 import multiprocessing as _mp
 import os
@@ -11,7 +10,7 @@ import time
 import traceback
 import urllib.parse
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import uvicorn
 from fastapi import (
@@ -29,7 +28,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, StringConstraints, model_validator
+from pydantic import BaseModel
 
 from app.auth import require_session
 from app.rate_limit import rate_limit
@@ -113,21 +112,14 @@ from .usb_manager import UsbActions, UsbDetector, UsbProfileManager, UsbSyncEngi
 _sync_lock = asyncio.Lock()
 
 # CONFIG LOGGING
-# Pre-set RedactingFormatter on each handler BEFORE basicConfig so the
-# `if h.formatter is None` guard (CPython 3.13 Lib/logging/__init__.py L110)
-# leaves our scrubbing formatter intact. Same instance on both handlers
-# guarantees the exc_text cache is scrubbed before any handler emits,
-# regardless of callHandlers iteration order.
-from .logging_utils import RedactingFormatter, safe_error_message_str
-
-_log_formatter = RedactingFormatter(
-    fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_DIR / "app.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-_log_file_handler = logging.FileHandler(LOG_DIR / "app.log", encoding='utf-8')
-_log_file_handler.setFormatter(_log_formatter)
-_log_stream_handler = logging.StreamHandler(sys.stdout)
-_log_stream_handler.setFormatter(_log_formatter)
-logging.basicConfig(level=logging.INFO, handlers=[_log_file_handler, _log_stream_handler])
 logger = logging.getLogger("APP_MAIN")
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -206,13 +198,13 @@ def validate_audio_path(path_str: str) -> Path:
     return file_path
 
 def safe_error_message(e: Exception) -> str:
-    """Sanitize error messages to avoid leaking internal paths or system info.
-
-    Delegates to `safe_error_message_str` in `app/logging_utils.py` so the
-    widened path list (incl. `EXPORT_DIR`/`MUSIC_DIR`/`TEMP_DIR`) is shared
-    with the log-write-time `RedactingFormatter`.
-    """
-    return safe_error_message_str(str(e))
+    """Sanitize error messages to avoid leaking internal paths or system info."""
+    msg = str(e)
+    # Strip absolute path prefixes from error messages
+    for sensitive in [APP_DIR, str(Path.home()), os.environ.get('APPDATA', '')]:
+        if sensitive:
+            msg = msg.replace(sensitive, '[...]')
+    return msg
 
 # --- SECURITY: CORS locked to localhost only ---
 app.add_middleware(
@@ -565,15 +557,11 @@ class FileRevealReq(BaseModel):
 
 @app.post("/api/file/reveal", dependencies=[Depends(require_session)])
 def file_reveal(r: FileRevealReq):
-    """Open the OS file explorer pointing at the given audio file path.
-
-    SECURITY: the path is sandboxed via ``validate_audio_path`` so any
-    authenticated caller can only reveal **audio files** inside
-    ``ALLOWED_AUDIO_ROOTS`` (or paths already known to ``db.tracks``).
-    See docs/research/research/evaluated_security-api-file-reveal-sandbox.md.
-    """
+    """Open the OS file explorer pointing at the given file/folder path."""
     try:
-        p = validate_audio_path(r.path)
+        p = Path(r.path)
+        if not p.exists():
+            raise HTTPException(404, f"Not found: {r.path}")
         import subprocess
         import sys
         if sys.platform == "win32":
