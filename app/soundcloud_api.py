@@ -1,6 +1,7 @@
 """
 SoundCloud Playlist API — Fetches playlists & favorites via the unofficial V2 API.
-Uses the auth_token (stored as HttpOnly cookie "sc_token") for authenticated requests.
+Uses the auth_token (stored in the OS keyring via `keyring.get_password`) for
+authenticated requests.
 
 Resilience features:
   - Exponential backoff on 429 Too Many Requests (Criterion 11)

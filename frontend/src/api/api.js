@@ -22,7 +22,7 @@ const API_BASE_URL = isTauri
 const api = axios.create({
     baseURL: API_BASE_URL,
     timeout: 10_000,          // EC8: 10 s hard timeout on every request
-    withCredentials: true,    // Send HttpOnly cookies (sc_token sentinel)
+    withCredentials: false,   // Bearer-in-header only; no cookie-auth transport
 });
 
 // Re-export the auth-store helpers under the legacy api.js names so

@@ -226,7 +226,7 @@ app.add_middleware(
         "tauri://localhost",
         "https://tauri.localhost",
     ],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "X-Session-Token", "Authorization"],
 )
@@ -3158,12 +3158,12 @@ class ScAuthTokenReq(BaseModel):
 @app.post("/api/soundcloud/auth-token", dependencies=[Depends(require_session)])
 @rate_limit(steady=5.0, burst=10, key_mode="both")
 async def set_soundcloud_auth_token(
-    request: Request, r: ScAuthTokenReq, response: Response
+    request: Request, r: ScAuthTokenReq
 ):
     """
     EC7/EC13: Persist the SC OAuth token in the OS keyring (not in cookies or JSON).
-    Sets a lightweight HttpOnly sentinel cookie so frontend can detect auth state
-    without ever seeing the raw token.
+    Frontend detects auth state via 401 responses on subsequent requests, not via
+    cookies — bearer-in-header is the only authenticated transport.
     """
     token = r.token.strip()
 
@@ -3196,15 +3196,6 @@ async def set_soundcloud_auth_token(
             pass
         logger.info("[SC] Auth token cleared from keyring (logout).")
 
-    # Sentinel cookie — value is never the real token (EC13)
-    response.set_cookie(
-        key="sc_token",
-        value="os_keyring_active" if token else "",
-        httponly=True,
-        samesite="lax",
-        secure=False,   # set to True when served over HTTPS
-        max_age=31536000 if token else 0
-    )
     return {"status": "success"}
 
 
